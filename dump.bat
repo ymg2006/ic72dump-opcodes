@@ -16,6 +16,8 @@ set SCRIPT_DIR=%~dp0
 set PHP=%SCRIPT_DIR%runtime\php.exe
 set PHP_INI=%SCRIPT_DIR%runtime\php.ini
 set DUMPER=%SCRIPT_DIR%opcodedump.php
+set OPCODEDUMP_STATIC_JUMP_MATERIALIZE=1
+if "%OPCODEDUMP_JUMP_MATERIALIZE_METHODS%"=="" set OPCODEDUMP_JUMP_MATERIALIZE_METHODS=*
 
 if not exist "%PHP%" (
     echo ERROR: runtime\php.exe not found. Keep dump.bat inside the ic72dump folder.

@@ -34,6 +34,7 @@ function normalize_key($key)
         'closure_repor' => 'closure_report',
         'declared_lambda' => 'declared_lambdas',
         'dumped_closure_op_array' => 'dumped_closure_op_arrays',
+        'fe_fetch_done_oplin' => 'fe_fetch_done_opline',
         'missin' => 'missing',
     );
 
@@ -440,7 +441,7 @@ function literal_ir($literal, $index)
     ));
 }
 
-function operand_ir(array $opcode, $prefix)
+function operand_ir(array $opcode, $prefix, array $cvNames = array())
 {
     $typeKey = $prefix . '_type';
     $typeNameKey = $prefix . '_type_name';
@@ -465,6 +466,68 @@ function operand_ir(array $opcode, $prefix)
         $operand['literal'] = safe_value($opcode[$literalKey]);
     }
 
+    return apply_clean_cv_name($operand, $cvNames);
+}
+
+function is_valid_php_variable_name($value)
+{
+    return is_string($value) && preg_match('/\A[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*\z/', $value);
+}
+
+function cv_index_from_operand(array $operand)
+{
+    if (!isset($operand['type_name']) || $operand['type_name'] !== 'IS_CV') {
+        return null;
+    }
+    if (!isset($operand['var'])) {
+        return null;
+    }
+
+    $slot = (int)((int)$operand['var'] / 16);
+    $index = $slot - 3; // PHP 7.2 32-bit: ZEND_CALL_FRAME_SLOT
+    return $index >= 0 ? $index : null;
+}
+
+function make_clean_cv_name($index, $rawName, array $argInfo)
+{
+    if (isset($argInfo[$index]['name']) && is_valid_php_variable_name($argInfo[$index]['name'])) {
+        return $argInfo[$index]['name'];
+    }
+
+    if (is_valid_php_variable_name($rawName) && is_printable_string($rawName)) {
+        return $rawName;
+    }
+
+    return '_cv' . $index;
+}
+
+function build_clean_cv_names(array $opArray, array $argInfo)
+{
+    $rawVars = isset($opArray['vars']) && is_array($opArray['vars']) ? array_values($opArray['vars']) : array();
+    $lastVar = isset($opArray['last_var']) ? (int)$opArray['last_var'] : count($rawVars);
+    $count = max($lastVar, count($rawVars), count($argInfo));
+    $names = array();
+
+    for ($i = 0; $i < $count; $i++) {
+        $rawName = isset($rawVars[$i]) && is_string($rawVars[$i]) ? $rawVars[$i] : null;
+        $names[$i] = make_clean_cv_name($i, $rawName, $argInfo);
+    }
+
+    return $names;
+}
+
+function apply_clean_cv_name(array $operand, array $cvNames)
+{
+    $index = cv_index_from_operand($operand);
+    if ($index === null || !isset($cvNames[$index])) {
+        return $operand;
+    }
+
+    if (isset($operand['cv_name']) && $operand['cv_name'] !== $cvNames[$index]) {
+        $operand['cv_name_raw'] = safe_value($operand['cv_name']);
+    }
+    $operand['cv_index'] = $index;
+    $operand['cv_name'] = $cvNames[$index];
     return $operand;
 }
 
@@ -482,8 +545,6 @@ function opcode_jump_targets(array $opcode)
         'ZEND_JMPNZ_EX',
         'ZEND_FE_RESET_R',
         'ZEND_FE_RESET_RW',
-        'ZEND_FE_FETCH_R',
-        'ZEND_FE_FETCH_RW',
         'ZEND_JMP_SET',
         'ZEND_COALESCE',
         'ZEND_ASSERT_CHECK',
@@ -499,6 +560,16 @@ function opcode_jump_targets(array $opcode)
     // JMPZNZ second target: non-zero/non-null branch resolved by C extension
     if ($name === 'ZEND_JMPZNZ' && isset($opcode['jmpznz_true_opline']) && (int)$opcode['jmpznz_true_opline'] >= 0) {
         $targets[] = (int)$opcode['jmpznz_true_opline'];
+    }
+    if (($name === 'ZEND_FE_FETCH_R' || $name === 'ZEND_FE_FETCH_RW')) {
+        if (isset($opcode['fe_fetch_done_opline']) && (int)$opcode['fe_fetch_done_opline'] >= 0) {
+            $targets[] = (int)$opcode['fe_fetch_done_opline'];
+        } elseif (isset($opcode['extended_value']) && isset($opcode['opcode_index'])) {
+            $ext = (int)$opcode['extended_value'];
+            if ($ext % 28 === 0) {
+                $targets[] = (int)$opcode['opcode_index'] + (int)($ext / 28);
+            }
+        }
     }
 
     return array_values(array_unique(array_filter($targets, function ($target) {
@@ -548,7 +619,7 @@ function decode_extended_value($opcodeName, $extVal)
     }
 }
 
-function opcode_ir(array $opcode, $index)
+function opcode_ir(array $opcode, $index, array $cvNames = array())
 {
     $targets    = opcode_jump_targets($opcode);
     $opcodeName = opcode_label($opcode);
@@ -564,11 +635,12 @@ function opcode_ir(array $opcode, $index)
         'lineno_raw'             => $linenoRaw !== $lineno ? $linenoRaw : null,
         'opcode'                 => isset($opcode['opcode']) ? $opcode['opcode'] : null,
         'opcode_name'            => $opcodeName,
+        'handler'                => isset($opcode['handler']) ? $opcode['handler'] : null,
         'extended_value'         => $extVal,
         'extended_value_decoded' => decode_extended_value($opcodeName, $extVal),
-        'op1'                    => operand_ir($opcode, 'op1'),
-        'op2'                    => operand_ir($opcode, 'op2'),
-        'result'                 => operand_ir($opcode, 'result'),
+        'op1'                    => operand_ir($opcode, 'op1', $cvNames),
+        'op2'                    => operand_ir($opcode, 'op2', $cvNames),
+        'result'                 => operand_ir($opcode, 'result', $cvNames),
         'jump_targets'           => $targets,
         'is_call'                => in_array($opcodeName, array('ZEND_INIT_FCALL', 'ZEND_INIT_FCALL_BY_NAME', 'ZEND_DO_FCALL', 'ZEND_DO_FCALL_BY_NAME'), true),
         'is_include_or_eval'     => $opcodeName === 'ZEND_INCLUDE_OR_EVAL',
@@ -578,6 +650,9 @@ function opcode_ir(array $opcode, $index)
     // JMPZNZ second target from C extension (non-zero/non-null branch)
     if ($opcodeName === 'ZEND_JMPZNZ' && isset($opcode['jmpznz_true_opline'])) {
         $ir['jmpznz_true_opline'] = (int)$opcode['jmpznz_true_opline'];
+    }
+    if (($opcodeName === 'ZEND_FE_FETCH_R' || $opcodeName === 'ZEND_FE_FETCH_RW') && isset($opcode['fe_fetch_done_opline'])) {
+        $ir['fe_fetch_done_opline'] = (int)$opcode['fe_fetch_done_opline'];
     }
 
     // Propagate decode_failed flag set by C extension on unreadable opcodes
@@ -915,13 +990,20 @@ function op_array_ir($id, $kind, array $opArray, array $meta = array())
     $opcodes  = isset($opArray['opcodes'])  && is_array($opArray['opcodes'])  ? $opArray['opcodes']  : array();
     $literalIr = array();
     $opcodeIr  = array();
+    $fnFlags         = isset($opArray['fn_flags'])         ? (int)$opArray['fn_flags']         : null;
+    $numArgs         = isset($opArray['num_args'])         ? (int)$opArray['num_args']         : null;
+    $requiredNumArgs = isset($opArray['required_num_args'])? (int)$opArray['required_num_args'] : null;
+    $rawArgInfo      = isset($opArray['arg_info']) && is_array($opArray['arg_info']) ? $opArray['arg_info'] : null;
+    $rawReturnType   = isset($opArray['return_type_info']) && is_array($opArray['return_type_info']) ? $opArray['return_type_info'] : null;
+    $argInfoIr       = arg_info_ir($rawArgInfo, $numArgs, $requiredNumArgs);
+    $cleanCvNames    = build_clean_cv_names($opArray, $argInfoIr);
 
     foreach ($literals as $index => $literal) {
         $literalIr[] = literal_ir($literal, $index);
     }
     foreach ($opcodes as $index => $opcode) {
         if (is_array($opcode)) {
-            $opcodeIr[] = opcode_ir($opcode, $index);
+            $opcodeIr[] = opcode_ir($opcode, $index, $cleanCvNames);
         }
     }
 
@@ -929,12 +1011,6 @@ function op_array_ir($id, $kind, array $opArray, array $meta = array())
         ? try_catch_ir($opArray['try_catch_array']) : array();
     $liveRange = isset($opArray['live_range']) && is_array($opArray['live_range'])
         ? live_range_ir($opArray['live_range']) : array();
-
-    $fnFlags         = isset($opArray['fn_flags'])         ? (int)$opArray['fn_flags']         : null;
-    $numArgs         = isset($opArray['num_args'])         ? (int)$opArray['num_args']         : null;
-    $requiredNumArgs = isset($opArray['required_num_args'])? (int)$opArray['required_num_args'] : null;
-    $rawArgInfo      = isset($opArray['arg_info']) && is_array($opArray['arg_info']) ? $opArray['arg_info'] : null;
-    $rawReturnType   = isset($opArray['return_type_info']) && is_array($opArray['return_type_info']) ? $opArray['return_type_info'] : null;
 
     return array(
         'id'                 => $id,
@@ -949,10 +1025,11 @@ function op_array_ir($id, $kind, array $opArray, array $meta = array())
         'fn_flags_decoded'   => $fnFlags !== null ? decode_fn_flags($fnFlags) : null,
         'num_args'           => $numArgs,
         'required_num_args'  => $requiredNumArgs,
-        'arg_info'           => arg_info_ir($rawArgInfo, $numArgs, $requiredNumArgs),
+        'arg_info'           => $argInfoIr,
         'return_type_info'   => return_type_ir($rawReturnType),
         'doc_comment'        => isset($opArray['doc_comment']) ? safe_value($opArray['doc_comment']) : safe_value(null),
-        'vars'               => isset($opArray['vars'])        ? safe_value($opArray['vars'])        : safe_value(null),
+        'vars'               => safe_value($cleanCvNames),
+        'vars_raw'           => isset($opArray['vars'])        ? safe_value($opArray['vars'])        : safe_value(null),
         'last_var'           => isset($opArray['last_var'])    ? $opArray['last_var']                : null,
         'T'                  => isset($opArray['T'])           ? $opArray['T']                       : null,
         'static_variables'   => isset($opArray['static_variables']) && is_array($opArray['static_variables'])
@@ -1306,7 +1383,11 @@ foreach ($targets as $target) {
     $outputPath = dump_output_path($resolved);
     $jsonOutputPath = dump_json_output_path($resolved);
     $serialized = print_r($dump, true);
-    $json = json_encode($ir, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    $jsonFlags = JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES;
+    if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) {
+        $jsonFlags |= JSON_INVALID_UTF8_SUBSTITUTE;
+    }
+    $json = json_encode($ir, $jsonFlags);
 
     if ($serialized === false || file_put_contents($outputPath, $serialized . PHP_EOL) === false) {
         fwrite(STDERR, "Failed to write dump file: {$outputPath}\n");

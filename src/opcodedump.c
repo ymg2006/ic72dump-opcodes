@@ -19,6 +19,7 @@
 #include "php_ini.h"
 #include "ext/standard/info.h"
 #include "Zend/zend_vm_opcodes.h"
+#include "Zend/zend_vm.h"
 #include "php_opcodedump.h"
 #include <stdint.h>
 #ifdef PHP_WIN32
@@ -266,8 +267,6 @@ static int dasm_operand_is_jump_target(zend_uchar opcode, int operand_index)
 		case ZEND_JMPNZ_EX:
 		case ZEND_FE_RESET_R:
 		case ZEND_FE_RESET_RW:
-		case ZEND_FE_FETCH_R:
-		case ZEND_FE_FETCH_RW:
 		case ZEND_JMP_SET:
 		case ZEND_COALESCE:
 		case ZEND_ASSERT_CHECK:
@@ -343,6 +342,33 @@ static zend_long dasm_jump_target_index(const zend_op_array *op_array, const zen
 
 	current_index = (opline != NULL) ? (zend_long)(opline - op_array->opcodes) : -1;
 
+#ifdef PHP_WIN32
+	target_index = dasm_index_from_address_base(
+	    (uintptr_t)operand.jmp_addr, (uintptr_t)op_array->opcodes, op_array->last);
+	if (target_index >= 0) return target_index;
+	if (current_index >= 0 && current_index < (zend_long)op_array->last && opline != NULL) {
+		uintptr_t local_base = (uintptr_t)opline - ((uintptr_t)current_index * sizeof(zend_op));
+		target_index = dasm_index_from_address_base(
+		    (uintptr_t)operand.jmp_addr, local_base, op_array->last);
+		if (target_index >= 0) return target_index;
+	}
+	__try {
+		const uint32_t *desc = (const uint32_t *)ic_lookup_desc(op_array);
+		if (desc && dasm_ic_committed_readable_ptr(desc)) {
+			if (desc[15]) {
+				target_index = dasm_index_from_address_base(
+				    (uintptr_t)operand.jmp_addr, (uintptr_t)desc[15], op_array->last);
+				if (target_index >= 0) return target_index;
+			}
+			if (desc[5]) {
+				target_index = dasm_index_from_address_base(
+				    (uintptr_t)operand.jmp_addr, (uintptr_t)desc[5], op_array->last);
+				if (target_index >= 0) return target_index;
+			}
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {}
+#endif
+
 #if ZEND_USE_ABS_JMP_ADDR
 	target_index = dasm_index_from_address_base(
 	    (uintptr_t)operand.jmp_addr, (uintptr_t)op_array->opcodes, op_array->last);
@@ -356,7 +382,10 @@ static zend_long dasm_jump_target_index(const zend_op_array *op_array, const zen
 #endif
 
 #ifdef PHP_WIN32
-	if (opcode == ZEND_JMPZ && operand_index == 2) {
+	/* Line-gap heuristic: only use when address-decode failed (target_index == -1).
+	 * Applying it unconditionally was overriding correctly decoded JMPZ targets,
+	 * breaking if/else structure reconstruction. */
+	if (opcode == ZEND_JMPZ && operand_index == 2 && target_index == -1) {
 		__try {
 			const uint32_t *desc = (const uint32_t *)ic_lookup_desc(op_array);
 			if (desc && dasm_ic_committed_readable_ptr(desc)) {
@@ -395,6 +424,115 @@ static void dasm_add_literal(zval *dst, const char *key,
 	add_assoc_zval(dst, key, &literal);
 }
 
+#ifdef PHP_WIN32
+static void dasm_add_literal_maybe_ic_decoded(zval *dst, const char *key,
+                                               const zend_op_array *op_array,
+                                               zend_uchar opcode, zend_uchar type,
+                                               znode_op operand, int should_decode,
+                                               uint32_t xor_key)
+{
+	zend_long literal_index;
+	zval tmp;
+	zval literal;
+
+	if (!should_decode) {
+		dasm_add_literal(dst, key, op_array, type, operand);
+		return;
+	}
+
+	if (type != IS_CONST || operand.zv == NULL) return;
+	literal_index = dasm_literal_index(op_array, operand.zv);
+	if (literal_index < 0) return;
+
+	/* Mirrors ionCube sub_10073450: for flagged IS_CONST operands it XORs
+	 * the first dword of the pointed zval with key_stream[op_index] | 1.
+	 * Work on a local copy so the dumper does not change runtime state. */
+	__try {
+		if (opcode == 0x89) {
+			dasm_add_literal(dst, key, op_array, type, operand);
+			return;
+		}
+		tmp = *operand.zv;
+		*(uint32_t *)&tmp ^= xor_key;
+		ZVAL_DUP(&literal, &tmp);
+		add_assoc_zval(dst, key, &literal);
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		dasm_add_literal(dst, key, op_array, type, operand);
+	}
+}
+#else
+static void dasm_add_literal_maybe_ic_decoded(zval *dst, const char *key,
+                                               const zend_op_array *op_array,
+                                               zend_uchar opcode, zend_uchar type,
+                                               znode_op operand, int should_decode,
+                                               uint32_t xor_key)
+{
+	(void)opcode;
+	(void)should_decode;
+	(void)xor_key;
+	dasm_add_literal(dst, key, op_array, type, operand);
+}
+#endif
+
+static int dasm_is_printable_identifier_bytes(const char *s, size_t len)
+{
+	size_t i;
+	if (s == NULL || len == 0) return 0;
+	for (i = 0; i < len; ++i) {
+		unsigned char c = (unsigned char)s[i];
+		if (c < 0x20 || c > 0x7e) return 0;
+	}
+	return 1;
+}
+
+static void dasm_add_var_name_stringl(zval *dst, const char *key, const char *s, size_t len)
+{
+	if (dasm_is_printable_identifier_bytes(s, len)) {
+		add_assoc_stringl(dst, key, (char *)s, len);
+	} else {
+		static const char prefix[] = "_obfuscated_";
+		size_t out_len = (sizeof(prefix) - 1) + (len * 2) + 1;
+		char *out = (char *)emalloc(out_len + 1);
+		size_t i, p = 0;
+		memcpy(out, prefix, sizeof(prefix) - 1);
+		p += sizeof(prefix) - 1;
+		for (i = 0; i < len; ++i) {
+			static const char hex[] = "0123456789ABCDEF";
+			unsigned char c = (unsigned char)s[i];
+			out[p++] = hex[c >> 4];
+			out[p++] = hex[c & 0x0f];
+		}
+		out[p++] = '_';
+		out[p] = '\0';
+		add_assoc_stringl(dst, key, out, p);
+		efree(out);
+	}
+}
+
+static void dasm_add_next_var_name_stringl(zval *dst, const char *s, size_t len)
+{
+	if (dasm_is_printable_identifier_bytes(s, len)) {
+		add_next_index_stringl(dst, s, len);
+	} else {
+		static const char prefix[] = "_obfuscated_";
+		size_t out_len = (sizeof(prefix) - 1) + (len * 2) + 1;
+		char *out = (char *)emalloc(out_len + 1);
+		size_t i, p = 0;
+		memcpy(out, prefix, sizeof(prefix) - 1);
+		p += sizeof(prefix) - 1;
+		for (i = 0; i < len; ++i) {
+			static const char hex[] = "0123456789ABCDEF";
+			unsigned char c = (unsigned char)s[i];
+			out[p++] = hex[c >> 4];
+			out[p++] = hex[c & 0x0f];
+		}
+		out[p++] = '_';
+		out[p] = '\0';
+		add_next_index_stringl(dst, out, p);
+		efree(out);
+	}
+}
+
 /* Resolves an IS_CV operand byte-offset to the human-readable variable name
  * stored in op_array->vars[].  The byte offset encodes the CV slot as:
  *   offset = (ZEND_CALL_FRAME_SLOT + cv_index) * sizeof(zval)
@@ -426,11 +564,11 @@ static void dasm_add_cv_name(zval *dst, const char *key,
 			if (_vlen == 0 || _vlen > 32768 ||
 			    !dasm_ic_committed_readable_ptr(_vname) ||
 			    !dasm_ic_committed_readable_ptr(_vname + _vlen)) return;
-			add_assoc_stringl(dst, key, (char *)_vname, _vlen);
+			dasm_add_var_name_stringl(dst, key, _vname, _vlen);
 		}
 	} __except(EXCEPTION_EXECUTE_HANDLER) {}
 #else
-	add_assoc_stringl(dst, key, ZSTR_VAL(var_name), ZSTR_LEN(var_name));
+	dasm_add_var_name_stringl(dst, key, ZSTR_VAL(var_name), ZSTR_LEN(var_name));
 #endif
 }
 
@@ -447,11 +585,629 @@ static void dasm_add_cv_name(zval *dst, const char *key,
 #ifndef IC_REQUEST_KEY_RVA
 #define IC_REQUEST_KEY_RVA 0xBEEA8u
 #endif
+#ifndef IC_STEP1_RVA
+#define IC_STEP1_RVA  0x2C30u
+#endif
+#ifndef IC_STEP2_RVA
+#define IC_STEP2_RVA  0x628D0u
+#endif
+#ifndef IC_LAZY_OPCODE_DECODE_RVA
+#define IC_LAZY_OPCODE_DECODE_RVA 0x73450u
+#endif
+#ifndef IC_GLOBAL_LITERAL_MATERIALIZE_RVA
+#define IC_GLOBAL_LITERAL_MATERIALIZE_RVA 0x626F0u
+#endif
+#ifndef IC_HIDE_OP_ARRAY_RVA
+#define IC_HIDE_OP_ARRAY_RVA 0x627B0u
+#endif
+#ifndef IC_JUMP_MATERIALIZE_RVA
+#define IC_JUMP_MATERIALIZE_RVA 0x0AE40u
+#endif
+#ifndef IC_OPERAND_MATERIALIZE_RVA
+#define IC_OPERAND_MATERIALIZE_RVA 0x0B0E0u
+#endif
+#ifndef IC_CALLBACK_CTX_SET_RVA
+#define IC_CALLBACK_CTX_SET_RVA 0x2140u
+#endif
 #define IC_DESC_MAP_MAX 4096
 
 static const zend_op_array *ic_desc_map_oa[IC_DESC_MAP_MAX];
 static void *ic_desc_map_desc[IC_DESC_MAP_MAX];
 static uint32_t ic_desc_map_count = 0;
+
+#define IC_RUNTIME_CAPTURE_MAX 8192
+#define IC_STEP2_HOOK_LEN 8
+#define IC_HIDE_OP_ARRAY_HOOK_LEN 8
+#define IC_JUMP_HOOK_LEN 8
+#define IC_CALLBACK_CTX_HOOK_LEN 7
+#define IC_JUMP_LOG_MAX 16384
+#define IC_CALLBACK_CTX_MAP_MAX 8192
+
+static const zend_op_array *ic_runtime_capture_oa[IC_RUNTIME_CAPTURE_MAX];
+static void *ic_runtime_capture_desc[IC_RUNTIME_CAPTURE_MAX];
+static zend_op *ic_runtime_capture_ops[IC_RUNTIME_CAPTURE_MAX];
+static uint32_t ic_runtime_capture_last[IC_RUNTIME_CAPTURE_MAX];
+static uint32_t ic_runtime_capture_count = 0;
+
+static const zend_op_array *ic_callback_ctx_oa[IC_CALLBACK_CTX_MAP_MAX];
+static void *ic_callback_ctx_desc[IC_CALLBACK_CTX_MAP_MAX];
+static void *ic_callback_ctx_ctx[IC_CALLBACK_CTX_MAP_MAX];
+static uint32_t ic_callback_ctx_count = 0;
+
+static uint8_t ic_step2_original[IC_STEP2_HOOK_LEN];
+static void *ic_step2_trampoline = NULL;
+static int ic_step2_hooked = 0;
+
+static uint8_t ic_hide_op_array_original[IC_HIDE_OP_ARRAY_HOOK_LEN];
+static void *ic_hide_op_array_trampoline = NULL;
+static int ic_hide_op_array_hooked = 0;
+
+static uint8_t ic_callback_ctx_original[IC_CALLBACK_CTX_HOOK_LEN];
+static void *ic_callback_ctx_trampoline = NULL;
+static int ic_callback_ctx_hooked = 0;
+
+typedef int (__fastcall *ic_step2_call_t)(void *ecx_this);
+typedef void *(__fastcall *ic_hide_op_array_call_t)(void *ecx_this);
+typedef void (__fastcall *ic_callback_ctx_set_call_t)(void *ecx_oa, void *edx_ctx);
+
+static int dasm_ic_committed_readable_ptr(const void *ptr);
+static void ic_remember_desc(const zend_op_array *op_array, void *desc);
+
+typedef int (__fastcall *ic_jump_materialize_call_t)(void *ecx_ctx, zend_op_array *edx_oa,
+                                                     zend_op *opline, unsigned int opcode,
+                                                     uint32_t map_a, uint32_t map_b);
+
+typedef struct _ic_jump_log_entry {
+	const zend_op_array *op_array;
+	void *desc;
+	zend_op *opline;
+	uint32_t index;
+	uint32_t opcode;
+	uint32_t before_op1;
+	uint32_t before_op2;
+	uint32_t after_op1;
+	uint32_t after_op2;
+	uint32_t before_ext;
+	uint32_t after_ext;
+	uint32_t ctx;
+	uint32_t map_a;
+	uint32_t map_b;
+} ic_jump_log_entry;
+
+static uint8_t ic_jump_original[IC_JUMP_HOOK_LEN];
+static void *ic_jump_trampoline = NULL;
+static int ic_jump_hooked = 0;
+static ic_jump_log_entry ic_jump_log[IC_JUMP_LOG_MAX];
+static uint32_t ic_jump_log_count = 0;
+static volatile uint32_t ic_jump_seen_count = 0;
+static uint32_t ic_static_materialize_seen = 0;
+static uint32_t ic_static_materialize_attempts = 0;
+static uint32_t ic_static_materialize_success = 0;
+static uint32_t ic_static_materialize_rejects[8];
+static uint32_t ic_operand_materialize_attempts = 0;
+static uint32_t ic_operand_materialize_success = 0;
+static uint32_t ic_operand_materialize_rejects[8];
+
+static int ic_env_list_contains_name(const char *env_name, const char *name)
+{
+	char buf[8192];
+	DWORD n;
+	const char *p;
+	size_t name_len;
+
+	if (name == NULL || *name == '\0') return 0;
+	n = GetEnvironmentVariableA(env_name, buf, sizeof(buf));
+	if (n == 0 || n >= sizeof(buf)) return 0;
+	if (buf[0] == '*') return 1;
+
+	name_len = strlen(name);
+	p = buf;
+	while (*p) {
+		const char *start;
+		size_t len;
+		while (*p == ' ' || *p == '\t' || *p == ',' || *p == ';') ++p;
+		start = p;
+		while (*p && *p != ',' && *p != ';') ++p;
+		len = (size_t)(p - start);
+		while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t')) --len;
+		if (len == name_len && _strnicmp(start, name, len) == 0) return 1;
+	}
+	return 0;
+}
+
+static void ic_runtime_capture_clear(void)
+{
+	uint32_t i;
+	for (i = 0; i < ic_runtime_capture_count; ++i) {
+		if (ic_runtime_capture_ops[i]) {
+			efree(ic_runtime_capture_ops[i]);
+			ic_runtime_capture_ops[i] = NULL;
+		}
+		ic_runtime_capture_oa[i] = NULL;
+		ic_runtime_capture_desc[i] = NULL;
+		ic_runtime_capture_last[i] = 0;
+	}
+	ic_runtime_capture_count = 0;
+}
+
+static int ic_runtime_capture_lookup(const zend_op_array *op_array, zend_op **ops_out, uint32_t *last_out)
+{
+	uint32_t i;
+	if (ops_out) *ops_out = NULL;
+	if (last_out) *last_out = 0;
+	if (op_array == NULL) return 0;
+	if (op_array->reserved[3] == NULL) return 0;
+	for (i = 0; i < ic_runtime_capture_count; ++i) {
+		if ((ic_runtime_capture_oa[i] == op_array && ic_runtime_capture_desc[i] == op_array->reserved[3]) ||
+		    ic_runtime_capture_desc[i] == op_array->reserved[3]) {
+			if (ops_out) *ops_out = ic_runtime_capture_ops[i];
+			if (last_out) *last_out = ic_runtime_capture_last[i];
+			return ic_runtime_capture_ops[i] != NULL && ic_runtime_capture_last[i] > 0;
+		}
+	}
+	return 0;
+}
+
+static int ic_runtime_capture_enabled(void)
+{
+	char buf[8];
+	DWORD n = GetEnvironmentVariableA("OPCODEDUMP_USE_RUNTIME_CAPTURE", buf, sizeof(buf));
+	return n > 0 && (buf[0] == '1' || buf[0] == 'y' || buf[0] == 'Y' || buf[0] == 't' || buf[0] == 'T');
+}
+
+static void ic_runtime_capture_op_array(zend_op_array *op_array)
+{
+	zend_op *copy;
+	uint32_t i;
+	SIZE_T size;
+
+	if (op_array == NULL || op_array->opcodes == NULL ||
+	    op_array->last == 0 || op_array->last >= 65536) return;
+
+	__try {
+		if (!dasm_ic_committed_readable_ptr(op_array->opcodes) ||
+		    !dasm_ic_committed_readable_ptr(op_array->opcodes + op_array->last - 1)) {
+			return;
+		}
+
+		size = (SIZE_T)op_array->last * sizeof(zend_op);
+		copy = (zend_op *)emalloc(size);
+		memcpy(copy, op_array->opcodes, size);
+
+		for (i = 0; i < ic_runtime_capture_count; ++i) {
+			if (ic_runtime_capture_oa[i] == op_array ||
+			    (op_array->reserved[3] && ic_runtime_capture_desc[i] == op_array->reserved[3])) {
+				if (ic_runtime_capture_ops[i]) efree(ic_runtime_capture_ops[i]);
+				ic_runtime_capture_oa[i] = op_array;
+				ic_runtime_capture_desc[i] = op_array->reserved[3];
+				ic_runtime_capture_ops[i] = copy;
+				ic_runtime_capture_last[i] = op_array->last;
+				return;
+			}
+		}
+
+		if (ic_runtime_capture_count < IC_RUNTIME_CAPTURE_MAX) {
+			ic_runtime_capture_oa[ic_runtime_capture_count] = op_array;
+			ic_runtime_capture_desc[ic_runtime_capture_count] = op_array->reserved[3];
+			ic_runtime_capture_ops[ic_runtime_capture_count] = copy;
+			ic_runtime_capture_last[ic_runtime_capture_count] = op_array->last;
+			ic_runtime_capture_count++;
+		} else {
+			efree(copy);
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static int ic_callback_ctx_is_plausible(void *ctx)
+{
+	if (ctx == NULL) return 0;
+	if (!dasm_ic_committed_readable_ptr(ctx) ||
+	    !dasm_ic_committed_readable_ptr((const char *)ctx + 0x44)) {
+		return 0;
+	}
+	__try {
+		uint32_t cb = *(const uint32_t *)((const char *)ctx + 0x40);
+		if (cb == 0 || !dasm_ic_committed_readable_ptr((const void *)(uintptr_t)cb)) return 0;
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+	return 1;
+}
+
+static void ic_remember_callback_ctx(zend_op_array *op_array, void *ctx)
+{
+	void *desc = NULL;
+	uint32_t i;
+
+	if (op_array == NULL || ctx == NULL || !ic_callback_ctx_is_plausible(ctx)) return;
+	__try {
+		desc = op_array->reserved[3];
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		desc = NULL;
+	}
+	if (desc == NULL || !dasm_ic_committed_readable_ptr(desc)) return;
+
+	ic_remember_desc(op_array, desc);
+	for (i = 0; i < ic_callback_ctx_count; ++i) {
+		if (ic_callback_ctx_oa[i] == op_array || ic_callback_ctx_desc[i] == desc) {
+			ic_callback_ctx_oa[i] = op_array;
+			ic_callback_ctx_desc[i] = desc;
+			ic_callback_ctx_ctx[i] = ctx;
+			return;
+		}
+	}
+	if (ic_callback_ctx_count < IC_CALLBACK_CTX_MAP_MAX) {
+		ic_callback_ctx_oa[ic_callback_ctx_count] = op_array;
+		ic_callback_ctx_desc[ic_callback_ctx_count] = desc;
+		ic_callback_ctx_ctx[ic_callback_ctx_count] = ctx;
+		ic_callback_ctx_count++;
+	}
+}
+
+static void *ic_lookup_callback_ctx(zend_op_array *op_array, void *desc)
+{
+	uint32_t i;
+	if (op_array == NULL && desc == NULL) return NULL;
+	for (i = 0; i < ic_callback_ctx_count; ++i) {
+		if ((op_array && ic_callback_ctx_oa[i] == op_array) ||
+		    (desc && ic_callback_ctx_desc[i] == desc)) {
+			if (ic_callback_ctx_is_plausible(ic_callback_ctx_ctx[i])) {
+				return ic_callback_ctx_ctx[i];
+			}
+		}
+	}
+	if (desc && dasm_ic_committed_readable_ptr(desc) &&
+	    dasm_ic_committed_readable_ptr((const char *)desc + 0x6c)) {
+		const uint32_t *want = (const uint32_t *)desc;
+		__try {
+			for (i = 0; i < ic_callback_ctx_count; ++i) {
+				const uint32_t *have = (const uint32_t *)ic_callback_ctx_desc[i];
+				if (!dasm_ic_committed_readable_ptr(have) ||
+				    !dasm_ic_committed_readable_ptr((const char *)have + 0x6c)) {
+					continue;
+				}
+				if (have[1] == want[1] &&
+				    have[5] == want[5] &&
+				    have[15] == want[15] &&
+				    have[17] == want[17] &&
+				    have[27] == want[27] &&
+				    ic_callback_ctx_is_plausible(ic_callback_ctx_ctx[i])) {
+					return ic_callback_ctx_ctx[i];
+				}
+			}
+		} __except(EXCEPTION_EXECUTE_HANDLER) {}
+	}
+	return NULL;
+}
+
+static void __fastcall ic_callback_ctx_set_detour(void *ecx_oa, void *edx_ctx)
+{
+	if (ic_callback_ctx_trampoline) {
+		((ic_callback_ctx_set_call_t)ic_callback_ctx_trampoline)(ecx_oa, edx_ctx);
+	}
+	ic_remember_callback_ctx((zend_op_array *)ecx_oa, edx_ctx);
+}
+
+static void *__fastcall ic_hide_op_array_detour(void *ecx_this, void *edx_unused)
+{
+	zend_op_array *op_array = (zend_op_array *)ecx_this;
+	HMODULE hLoader;
+	(void)edx_unused;
+
+	/* sub_100627B0 is the compile-time hide pass.  At this point the
+	 * loader has already built the real PHP 7.2 op_array.  For a dumper,
+	 * preserving that clean state is better than hiding it and trying to
+	 * reconstruct operands later. */
+	__try {
+		if (op_array && op_array->reserved[3]) {
+			uint32_t *desc = (uint32_t *)op_array->reserved[3];
+			ic_remember_desc(op_array, op_array->reserved[3]);
+			if (dasm_ic_committed_readable_ptr(desc) &&
+			    dasm_ic_committed_readable_ptr((const char *)desc + 0x6c) &&
+			    desc[19] &&
+			    ic_callback_ctx_is_plausible((void *)(uintptr_t)desc[19])) {
+				typedef int (__fastcall *fn_t)(void *ecx_this);
+				fn_t step1;
+				zend_op *decoded_ops = NULL;
+				hLoader = GetModuleHandleA(IC_LOADER_NAME);
+				if (hLoader) {
+					step1 = (fn_t)((uintptr_t)hLoader + IC_STEP1_RVA);
+					__try { step1(op_array); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+					__try { decoded_ops = *(zend_op **)((char *)op_array + 40); }
+					__except(EXCEPTION_EXECUTE_HANDLER) { decoded_ops = NULL; }
+					if (decoded_ops) op_array->opcodes = decoded_ops;
+					if (op_array->last == 0 && desc[27] > 0 && desc[27] < 65536) {
+						op_array->last = desc[27];
+					}
+				}
+			}
+			ic_runtime_capture_op_array(op_array);
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {}
+	return ecx_this;
+}
+
+static int __fastcall ic_step2_detour(void *ecx_this, void *edx_unused)
+{
+	int result = 0;
+	(void)edx_unused;
+	if (ic_step2_trampoline) {
+		result = ((ic_step2_call_t)ic_step2_trampoline)(ecx_this);
+	}
+	if (result) {
+		ic_runtime_capture_op_array((zend_op_array *)ecx_this);
+	}
+	return result;
+}
+
+static void ic_jump_log_clear(void)
+{
+	ic_jump_log_count = 0;
+}
+
+static void __cdecl ic_jump_log_before_raw(void *ctx, zend_op_array *op_array, zend_op *opline,
+                                           unsigned int opcode, uint32_t map_a, uint32_t map_b)
+{
+	ic_jump_log_entry *entry;
+	if (ic_jump_log_count >= IC_JUMP_LOG_MAX) return;
+	entry = &ic_jump_log[ic_jump_log_count++];
+	entry->op_array = op_array;
+	entry->desc = NULL;
+	entry->opline = opline;
+	entry->index = 0xffffffffu;
+	entry->opcode = opcode;
+	entry->before_op1 = 0;
+	entry->before_op2 = 0;
+	entry->after_op1 = 0;
+	entry->after_op2 = 0;
+	entry->before_ext = 0;
+	entry->after_ext = 0;
+	entry->ctx = (uint32_t)(uintptr_t)ctx;
+	entry->map_a = map_a;
+	entry->map_b = map_b;
+	__try {
+		if (op_array && op_array->reserved[3]) entry->desc = op_array->reserved[3];
+		if (op_array && op_array->opcodes && opline >= op_array->opcodes &&
+		    opline < op_array->opcodes + op_array->last) {
+			entry->index = (uint32_t)(opline - op_array->opcodes);
+		}
+		if (opline) {
+			entry->before_op1 = opline->op1.num;
+			entry->before_op2 = opline->op2.num;
+			entry->before_ext = opline->extended_value;
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void __cdecl ic_jump_log_after_raw(void)
+{
+	ic_jump_log_entry *entry;
+	if (ic_jump_log_count == 0) return;
+	entry = &ic_jump_log[ic_jump_log_count - 1];
+	__try {
+		if (entry->opline) {
+			entry->after_op1 = entry->opline->op1.num;
+			entry->after_op2 = entry->opline->op2.num;
+			entry->after_ext = entry->opline->extended_value;
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+#if defined(_MSC_VER) && defined(_M_IX86)
+__declspec(naked) static int ic_jump_detour(void)
+{
+	__asm {
+		inc dword ptr [ic_jump_seen_count]
+
+		pushfd
+		pushad
+		push dword ptr [esp+52]
+		push dword ptr [esp+52]
+		push dword ptr [esp+52]
+		push dword ptr [esp+52]
+		push dword ptr [esp+36]
+		push dword ptr [esp+40]
+		call ic_jump_log_before_raw
+		add esp, 24
+		popad
+		popfd
+
+		push dword ptr [esp+16]
+		push dword ptr [esp+16]
+		push dword ptr [esp+16]
+		push dword ptr [esp+16]
+		call dword ptr [ic_jump_trampoline]
+		add esp, 16
+
+		push eax
+		pushfd
+		pushad
+		call ic_jump_log_after_raw
+		popad
+		popfd
+		pop eax
+		ret
+	}
+}
+#else
+static int __fastcall ic_jump_detour(void *ecx_ctx, zend_op_array *edx_oa,
+                                     zend_op *opline, unsigned int opcode,
+                                     uint32_t map_a, uint32_t map_b)
+{
+	int result = 0;
+	++ic_jump_seen_count;
+	ic_jump_log_before_raw(ecx_ctx, edx_oa, opline, opcode, map_a, map_b);
+
+	if (ic_jump_trampoline) {
+		result = ((ic_jump_materialize_call_t)ic_jump_trampoline)(
+			ecx_ctx, edx_oa, opline, opcode, map_a, map_b);
+	}
+	ic_jump_log_after_raw();
+	return result;
+}
+#endif
+
+static int ic_install_jump_hook(uintptr_t loader_base)
+{
+	uint8_t *target;
+	uint8_t *tramp;
+	DWORD old_protect = 0;
+	uintptr_t rel;
+
+	if (ic_jump_hooked) return 1;
+	if (loader_base == 0) return 0;
+
+	target = (uint8_t *)(loader_base + IC_JUMP_MATERIALIZE_RVA);
+	if (!dasm_ic_committed_readable_ptr(target)) return 0;
+
+	tramp = (uint8_t *)VirtualAlloc(NULL, IC_JUMP_HOOK_LEN + 5,
+	    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!tramp) return 0;
+
+	memcpy(ic_jump_original, target, IC_JUMP_HOOK_LEN);
+	memcpy(tramp, target, IC_JUMP_HOOK_LEN);
+	tramp[IC_JUMP_HOOK_LEN] = 0xE9;
+	rel = (uintptr_t)(target + IC_JUMP_HOOK_LEN) - (uintptr_t)(tramp + IC_JUMP_HOOK_LEN + 5);
+	*(int32_t *)(tramp + IC_JUMP_HOOK_LEN + 1) = (int32_t)rel;
+
+	if (!VirtualProtect(target, IC_JUMP_HOOK_LEN, PAGE_EXECUTE_READWRITE, &old_protect)) {
+		VirtualFree(tramp, 0, MEM_RELEASE);
+		return 0;
+	}
+
+	target[0] = 0xE9;
+	rel = (uintptr_t)&ic_jump_detour - (uintptr_t)(target + 5);
+	*(int32_t *)(target + 1) = (int32_t)rel;
+	memset(target + 5, 0x90, IC_JUMP_HOOK_LEN - 5);
+	VirtualProtect(target, IC_JUMP_HOOK_LEN, old_protect, &old_protect);
+	FlushInstructionCache(GetCurrentProcess(), target, IC_JUMP_HOOK_LEN);
+
+	ic_jump_trampoline = tramp;
+	ic_jump_hooked = 1;
+	return 1;
+}
+
+static int ic_install_step2_hook(uintptr_t loader_base)
+{
+	uint8_t *target;
+	uint8_t *tramp;
+	DWORD old_protect = 0;
+	uintptr_t rel;
+
+	if (ic_step2_hooked) return 1;
+	if (loader_base == 0) return 0;
+
+	target = (uint8_t *)(loader_base + IC_STEP2_RVA);
+	if (!dasm_ic_committed_readable_ptr(target)) return 0;
+
+	tramp = (uint8_t *)VirtualAlloc(NULL, IC_STEP2_HOOK_LEN + 5,
+	    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!tramp) return 0;
+
+	memcpy(ic_step2_original, target, IC_STEP2_HOOK_LEN);
+	memcpy(tramp, target, IC_STEP2_HOOK_LEN);
+	tramp[IC_STEP2_HOOK_LEN] = 0xE9;
+	rel = (uintptr_t)(target + IC_STEP2_HOOK_LEN) - (uintptr_t)(tramp + IC_STEP2_HOOK_LEN + 5);
+	*(int32_t *)(tramp + IC_STEP2_HOOK_LEN + 1) = (int32_t)rel;
+
+	if (!VirtualProtect(target, IC_STEP2_HOOK_LEN, PAGE_EXECUTE_READWRITE, &old_protect)) {
+		VirtualFree(tramp, 0, MEM_RELEASE);
+		return 0;
+	}
+
+	target[0] = 0xE9;
+	rel = (uintptr_t)&ic_step2_detour - (uintptr_t)(target + 5);
+	*(int32_t *)(target + 1) = (int32_t)rel;
+	memset(target + 5, 0x90, IC_STEP2_HOOK_LEN - 5);
+	VirtualProtect(target, IC_STEP2_HOOK_LEN, old_protect, &old_protect);
+	FlushInstructionCache(GetCurrentProcess(), target, IC_STEP2_HOOK_LEN);
+
+	ic_step2_trampoline = tramp;
+	ic_step2_hooked = 1;
+	return 1;
+}
+
+static int ic_install_hide_op_array_hook(uintptr_t loader_base)
+{
+	uint8_t *target;
+	uint8_t *tramp;
+	DWORD old_protect = 0;
+	uintptr_t rel;
+
+	if (ic_hide_op_array_hooked) return 1;
+	if (loader_base == 0) return 0;
+
+	target = (uint8_t *)(loader_base + IC_HIDE_OP_ARRAY_RVA);
+	if (!dasm_ic_committed_readable_ptr(target)) return 0;
+
+	tramp = (uint8_t *)VirtualAlloc(NULL, IC_HIDE_OP_ARRAY_HOOK_LEN + 5,
+	    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!tramp) return 0;
+
+	memcpy(ic_hide_op_array_original, target, IC_HIDE_OP_ARRAY_HOOK_LEN);
+	memcpy(tramp, target, IC_HIDE_OP_ARRAY_HOOK_LEN);
+	tramp[IC_HIDE_OP_ARRAY_HOOK_LEN] = 0xE9;
+	rel = (uintptr_t)(target + IC_HIDE_OP_ARRAY_HOOK_LEN) -
+	      (uintptr_t)(tramp + IC_HIDE_OP_ARRAY_HOOK_LEN + 5);
+	*(int32_t *)(tramp + IC_HIDE_OP_ARRAY_HOOK_LEN + 1) = (int32_t)rel;
+
+	if (!VirtualProtect(target, IC_HIDE_OP_ARRAY_HOOK_LEN, PAGE_EXECUTE_READWRITE, &old_protect)) {
+		VirtualFree(tramp, 0, MEM_RELEASE);
+		return 0;
+	}
+
+	target[0] = 0xE9;
+	rel = (uintptr_t)&ic_hide_op_array_detour - (uintptr_t)(target + 5);
+	*(int32_t *)(target + 1) = (int32_t)rel;
+	memset(target + 5, 0x90, IC_HIDE_OP_ARRAY_HOOK_LEN - 5);
+	VirtualProtect(target, IC_HIDE_OP_ARRAY_HOOK_LEN, old_protect, &old_protect);
+	FlushInstructionCache(GetCurrentProcess(), target, IC_HIDE_OP_ARRAY_HOOK_LEN);
+
+	ic_hide_op_array_trampoline = tramp;
+	ic_hide_op_array_hooked = 1;
+	return 1;
+}
+
+static int ic_install_callback_ctx_hook(uintptr_t loader_base)
+{
+	uint8_t *target;
+	uint8_t *tramp;
+	DWORD old_protect = 0;
+	uintptr_t rel;
+
+	if (ic_callback_ctx_hooked) return 1;
+	if (loader_base == 0) return 0;
+
+	target = (uint8_t *)(loader_base + IC_CALLBACK_CTX_SET_RVA);
+	if (!dasm_ic_committed_readable_ptr(target)) return 0;
+
+	tramp = (uint8_t *)VirtualAlloc(NULL, IC_CALLBACK_CTX_HOOK_LEN + 5,
+	    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!tramp) return 0;
+
+	memcpy(ic_callback_ctx_original, target, IC_CALLBACK_CTX_HOOK_LEN);
+	memcpy(tramp, target, IC_CALLBACK_CTX_HOOK_LEN);
+	tramp[IC_CALLBACK_CTX_HOOK_LEN] = 0xE9;
+	rel = (uintptr_t)(target + IC_CALLBACK_CTX_HOOK_LEN) -
+	      (uintptr_t)(tramp + IC_CALLBACK_CTX_HOOK_LEN + 5);
+	*(int32_t *)(tramp + IC_CALLBACK_CTX_HOOK_LEN + 1) = (int32_t)rel;
+
+	if (!VirtualProtect(target, IC_CALLBACK_CTX_HOOK_LEN, PAGE_EXECUTE_READWRITE, &old_protect)) {
+		VirtualFree(tramp, 0, MEM_RELEASE);
+		return 0;
+	}
+
+	target[0] = 0xE9;
+	rel = (uintptr_t)&ic_callback_ctx_set_detour - (uintptr_t)(target + 5);
+	*(int32_t *)(target + 1) = (int32_t)rel;
+	memset(target + 5, 0x90, IC_CALLBACK_CTX_HOOK_LEN - 5);
+	VirtualProtect(target, IC_CALLBACK_CTX_HOOK_LEN, old_protect, &old_protect);
+	FlushInstructionCache(GetCurrentProcess(), target, IC_CALLBACK_CTX_HOOK_LEN);
+
+	ic_callback_ctx_trampoline = tramp;
+	ic_callback_ctx_hooked = 1;
+	return 1;
+}
 
 static void ic_remember_desc(const zend_op_array *op_array, void *desc)
 {
@@ -490,6 +1246,31 @@ static int dasm_ic_committed_readable_ptr(const void *ptr)
 	    mbi.Protect == PAGE_EXECUTE) return 0;
 	return 1;
 }
+
+static uintptr_t dasm_ic_loader_base(void)
+{
+	HMODULE hLoader = GetModuleHandleA(IC_LOADER_NAME);
+	return hLoader ? (uintptr_t)hLoader : 0;
+}
+
+static uint32_t dasm_ic_loader_size(uintptr_t loader_base)
+{
+	const IMAGE_DOS_HEADER *dos;
+	const IMAGE_NT_HEADERS *nt;
+	if (loader_base == 0) return 0;
+	__try {
+		dos = (const IMAGE_DOS_HEADER *)loader_base;
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+		nt = (const IMAGE_NT_HEADERS *)(loader_base + (uintptr_t)dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+		return nt->OptionalHeader.SizeOfImage;
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+}
+
+static zend_uchar dasm_ic_display_opcode(const zend_op_array *op_array, const zend_op *opline,
+                                          zend_uchar opcode);
 
 static int dasm_ic_key_material_for_index(const zend_op_array *op_array, zend_long op_index,
                                             zend_uchar *key_byte_out, uint32_t *key_dword_out)
@@ -535,6 +1316,635 @@ static int dasm_ic_key_material_for_index(const zend_op_array *op_array, zend_lo
 	return 1;
 }
 
+static int dasm_ic_literal_xor_for_index(const zend_op_array *op_array, zend_long op_index,
+                                         uint8_t *literal_flags_out, uint32_t *xor_key_out)
+{
+	const uint32_t *desc;
+	uint32_t runtime_flags;
+	const uint8_t *literal_flags;
+	uint32_t key_dword;
+
+	if (literal_flags_out) *literal_flags_out = 0;
+	if (xor_key_out)       *xor_key_out       = 0;
+
+	if (op_array == NULL || op_index < 0 || op_index >= (zend_long)op_array->last) return 0;
+
+	desc = (const uint32_t *)ic_lookup_desc(op_array);
+	if (!dasm_ic_committed_readable_ptr(desc)) return 0;
+	if (!dasm_ic_committed_readable_ptr((const void *)(uintptr_t)desc[21]) ||
+	    !dasm_ic_committed_readable_ptr((const void *)((uintptr_t)desc[21] + 112))) {
+		return 0;
+	}
+
+	runtime_flags = *(const uint32_t *)((uintptr_t)desc[21] + 112);
+	if ((runtime_flags & 0x400u) == 0 || desc[4] == 0) return 0;
+
+	literal_flags = (const uint8_t *)(uintptr_t)desc[4];
+	if (!dasm_ic_committed_readable_ptr(literal_flags + op_index)) return 0;
+	if (!dasm_ic_key_material_for_index(op_array, op_index, NULL, &key_dword)) return 0;
+
+	if (literal_flags_out) *literal_flags_out = literal_flags[op_index];
+	if (xor_key_out)       *xor_key_out       = key_dword | 1u;
+	return 1;
+}
+
+static int dasm_ic_loader_lazy_decode_opcode(const zend_op_array *op_array, const zend_op *opline,
+                                             zend_uchar *opcode_out)
+{
+	HMODULE hLoader;
+	void *fn;
+	void *desc;
+	uint32_t op_index;
+	zend_uchar decoded = 0;
+
+	if (opcode_out) *opcode_out = 0;
+	if (op_array == NULL || opline == NULL || op_array->opcodes == NULL) return 0;
+	if (opline < op_array->opcodes || opline >= op_array->opcodes + op_array->last) return 0;
+
+	desc = ic_lookup_desc(op_array);
+	if (!dasm_ic_committed_readable_ptr(desc)) return 0;
+
+	hLoader = GetModuleHandleA(IC_LOADER_NAME);
+	if (!hLoader) return 0;
+	fn = (void *)((uintptr_t)hLoader + IC_LAZY_OPCODE_DECODE_RVA);
+	if (!dasm_ic_committed_readable_ptr(fn)) return 0;
+
+	op_index = (uint32_t)(opline - op_array->opcodes);
+
+	__try {
+#if defined(_M_IX86)
+		__asm {
+			push desc
+			push opline
+			mov edx, op_index
+			call fn
+			add esp, 8
+			mov decoded, al
+		}
+#else
+		return 0;
+#endif
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+
+	if (opcode_out) *opcode_out = decoded;
+	return 1;
+}
+
+static int dasm_ic_call_global_literal_materializer(zend_op_array *op_array)
+{
+	HMODULE hLoader;
+	void *fn;
+	void *desc_ptr;
+	const uint32_t *desc;
+	const uint32_t *runtime_meta;
+	zend_arg_info *saved_arg_info;
+	uint32_t scratch_arg_info = 0;
+	int called = 0;
+
+	if (op_array == NULL || op_array->opcodes == NULL ||
+	    op_array->last == 0 || op_array->last >= 65536) {
+		return 0;
+	}
+
+	desc_ptr = ic_lookup_desc(op_array);
+	desc = (const uint32_t *)desc_ptr;
+	if (!dasm_ic_committed_readable_ptr(desc)) return 0;
+
+	__try {
+		if (desc[1] == 0xFFFFFFFFu || desc[4] == 0 || desc[21] == 0) return 0;
+		if (!dasm_ic_committed_readable_ptr((const void *)(uintptr_t)desc[4])) return 0;
+		runtime_meta = (const uint32_t *)(uintptr_t)desc[21];
+		if (!dasm_ic_committed_readable_ptr(runtime_meta) ||
+		    !dasm_ic_committed_readable_ptr(runtime_meta + (0x7cu / sizeof(uint32_t))) ||
+		    runtime_meta[0x7cu / sizeof(uint32_t)] <= 0x35u) {
+			return 0;
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+
+	hLoader = GetModuleHandleA(IC_LOADER_NAME);
+	if (!hLoader) return 0;
+	fn = (void *)((uintptr_t)hLoader + IC_GLOBAL_LITERAL_MATERIALIZE_RVA);
+	if (!dasm_ic_committed_readable_ptr(fn)) return 0;
+
+	/* sub_100626F0 is the loader's full pass over desc[4] literal flags.
+	 * It expects op_array in ECX and blindly writes through arg_info
+	 * (mov eax,[op_array+0x20]; mov [eax],1) before calling step2.  For
+	 * dump-time use we provide a temporary writable dword so no real arg_info
+	 * metadata is corrupted and methods with no args do not fault before the
+	 * materialization loop. */
+	saved_arg_info = op_array->arg_info;
+	__try {
+		op_array->arg_info = (zend_arg_info *)&scratch_arg_info;
+#if defined(_M_IX86)
+		__asm {
+			mov ecx, op_array
+			call fn
+		}
+		called = 1;
+#else
+		called = 0;
+#endif
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		called = 0;
+	}
+	__try {
+		op_array->arg_info = saved_arg_info;
+	} __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+	return called;
+}
+
+typedef int (__fastcall *ic_loader_jump_materialize_call_t)(void *ecx_ctx, zend_op_array *edx_oa,
+                                                            zend_op *opline, unsigned int opcode,
+                                                            uint32_t map_a, uint32_t map_b);
+
+typedef void (__fastcall *ic_loader_operand_materialize_call_t)(void *ecx_ctx, zend_op_array *edx_oa,
+                                                               zend_op *opline, unsigned int opcode);
+
+static int dasm_ic_loader_ctx_for_op_array(const zend_op_array *op_array, void **ctx_out)
+{
+	const uint32_t *desc;
+	const uint32_t *runtime_meta;
+	void *ctx = NULL;
+
+	if (ctx_out) *ctx_out = NULL;
+	if (op_array == NULL) return 0;
+
+	desc = (const uint32_t *)ic_lookup_desc(op_array);
+	if (!dasm_ic_committed_readable_ptr(desc)) return 0;
+
+	runtime_meta = (const uint32_t *)(uintptr_t)desc[21];
+	__try {
+		if (runtime_meta &&
+		    dasm_ic_committed_readable_ptr(runtime_meta + (0x84u / sizeof(uint32_t))) &&
+		    dasm_ic_committed_readable_ptr(runtime_meta + (0x7cu / sizeof(uint32_t))) &&
+		    runtime_meta[0x84u / sizeof(uint32_t)] > 8 &&
+		    runtime_meta[0x7cu / sizeof(uint32_t)] >= 0x35u) {
+			ctx = (void *)((uintptr_t)desc + 0x1cu);
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		ctx = NULL;
+	}
+
+	if (!ctx || !dasm_ic_committed_readable_ptr(ctx)) return 0;
+	if (ctx_out) *ctx_out = ctx;
+	return 1;
+}
+
+static int dasm_ic_call_loader_operand_materializer(zend_op_array *op_array, zend_op *opline,
+                                                    zend_uchar decoded_opcode)
+{
+	HMODULE hLoader;
+	ic_loader_operand_materialize_call_t fn;
+	void *ctx = NULL;
+	uint32_t before_op1 = 0;
+	uint32_t before_op2 = 0;
+	uint32_t before_result = 0;
+	uint32_t before_ext = 0;
+	uint32_t before_lineno = 0;
+	unsigned int opcode_arg = (unsigned int)decoded_opcode;
+
+	++ic_operand_materialize_attempts;
+	if (op_array == NULL || opline == NULL) return 0;
+	if ((opline->lineno & 0x200000u) != 0) {
+		++ic_operand_materialize_success;
+		return 1;
+	}
+	if (!dasm_ic_loader_ctx_for_op_array(op_array, &ctx)) {
+		++ic_operand_materialize_rejects[0];
+		return 0;
+	}
+
+	hLoader = GetModuleHandleA(IC_LOADER_NAME);
+	if (!hLoader) {
+		++ic_operand_materialize_rejects[1];
+		return 0;
+	}
+	fn = (ic_loader_operand_materialize_call_t)((uintptr_t)hLoader + IC_OPERAND_MATERIALIZE_RVA);
+	if (!dasm_ic_committed_readable_ptr((const void *)fn)) {
+		++ic_operand_materialize_rejects[2];
+		return 0;
+	}
+
+	__try {
+		before_op1 = opline->op1.num;
+		before_op2 = opline->op2.num;
+		before_result = opline->result.num;
+		before_ext = opline->extended_value;
+		before_lineno = opline->lineno;
+#if defined(_M_IX86)
+		__asm {
+			push opcode_arg
+			push opline
+			mov edx, op_array
+			mov ecx, ctx
+			call fn
+			add esp, 8
+		}
+#else
+		return 0;
+#endif
+		if (opline->op1.num != before_op1 ||
+		    opline->op2.num != before_op2 ||
+		    opline->result.num != before_result ||
+		    opline->extended_value != before_ext ||
+		    opline->lineno != before_lineno ||
+		    (opline->lineno & 0x200000u) != 0) {
+			++ic_operand_materialize_success;
+			return 1;
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		++ic_operand_materialize_rejects[3];
+		return 0;
+	}
+	++ic_operand_materialize_rejects[4];
+	return 0;
+}
+
+static int dasm_ic_call_loader_jump_materializer(zend_op_array *op_array, zend_op *opline,
+                                                 zend_uchar decoded_opcode)
+{
+	HMODULE hLoader;
+	ic_loader_jump_materialize_call_t fn;
+	const uint32_t *desc;
+	void *ctx;
+	const uint32_t *runtime_meta;
+	uint32_t map_a = 0;
+	uint32_t map_b = 0;
+	uint32_t before_op1 = 0;
+	uint32_t before_op2 = 0;
+	uint32_t before_ext = 0;
+	int result = 0;
+
+	if (op_array == NULL || opline == NULL) return 0;
+	if (op_array->opcodes == NULL || op_array->last == 0 || op_array->last >= 65536) return 0;
+	if (!(decoded_opcode == ZEND_JMP ||
+	      decoded_opcode == ZEND_JMPZ ||
+	      decoded_opcode == ZEND_JMPNZ ||
+	      decoded_opcode == ZEND_JMPZNZ ||
+	      decoded_opcode == ZEND_JMPZ_EX ||
+	      decoded_opcode == ZEND_JMPNZ_EX ||
+	      decoded_opcode == ZEND_JMP_SET)) {
+		return 0;
+	}
+	if ((opline->extended_value & 0x200000u) != 0) return 1;
+
+	desc = (const uint32_t *)ic_lookup_desc(op_array);
+	if (!dasm_ic_committed_readable_ptr(desc) ||
+	    !dasm_ic_committed_readable_ptr(desc + 26)) {
+		return 0;
+	}
+
+	ctx = NULL;
+	runtime_meta = (const uint32_t *)(uintptr_t)desc[21];
+	__try {
+		if (runtime_meta &&
+		    dasm_ic_committed_readable_ptr(runtime_meta + (0x84u / sizeof(uint32_t))) &&
+		    dasm_ic_committed_readable_ptr(runtime_meta + (0x7cu / sizeof(uint32_t))) &&
+		    runtime_meta[0x84u / sizeof(uint32_t)] > 8 &&
+		    runtime_meta[0x7cu / sizeof(uint32_t)] >= 0x35u) {
+			ctx = (void *)((uintptr_t)desc + 0x1cu);
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		ctx = NULL;
+	}
+	map_a = desc[25];
+	map_b = desc[26];
+
+	hLoader = GetModuleHandleA(IC_LOADER_NAME);
+	if (!hLoader) return 0;
+	fn = (ic_loader_jump_materialize_call_t)((uintptr_t)hLoader + IC_JUMP_MATERIALIZE_RVA);
+	if (!dasm_ic_committed_readable_ptr((const void *)fn)) return 0;
+
+	__try {
+		before_op1 = opline->op1.num;
+		before_op2 = opline->op2.num;
+		before_ext = opline->extended_value;
+		result = fn(ctx, op_array, opline, decoded_opcode, map_a, map_b);
+		if (opline->op1.num != before_op1 ||
+		    opline->op2.num != before_op2 ||
+		    opline->extended_value != before_ext ||
+		    (opline->extended_value & 0x200000u) != 0) {
+			return 1;
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+
+	(void)result;
+	return 0;
+}
+
+static void dasm_ic_loader_materialize_jump_operand(zend_op_array *op_array, zend_op *opline,
+                                                    zend_uchar decoded_opcode)
+{
+	void *desc_ptr;
+	const uint32_t *desc;
+	const uint32_t *runtime_meta;
+	const uint32_t *ctx;
+	znode_op *jump_node;
+	uintptr_t base;
+	uintptr_t op_addr;
+	uintptr_t old_target;
+	uintptr_t lower;
+	uintptr_t upper;
+	uintptr_t current_base;
+	uintptr_t new_target;
+	uint32_t last;
+	uint32_t cur;
+	uint32_t span;
+	uint32_t rot;
+	uint32_t h0, h1, h2, h3, h4, h5, h6, h7;
+	uint32_t divisor;
+	uint32_t *map_a;
+	uint32_t *map_b;
+	uint32_t last_linear;
+	uint32_t op_array_flags;
+	int maps_ok = 0;
+
+	if (op_array == NULL || opline == NULL) return;
+	++ic_static_materialize_seen;
+	if (op_array->opcodes == NULL || op_array->last == 0 || op_array->last >= 65536) {
+		++ic_static_materialize_rejects[0];
+		return;
+	}
+	if (op_array->function_name == NULL ||
+	    !dasm_ic_committed_readable_ptr(op_array->function_name)) {
+		++ic_static_materialize_rejects[1];
+		return;
+	}
+	if (ic_env_list_contains_name("OPCODEDUMP_JUMP_MATERIALIZE_SKIP_METHODS", ZSTR_VAL(op_array->function_name)) ||
+	    !ic_env_list_contains_name("OPCODEDUMP_JUMP_MATERIALIZE_METHODS", ZSTR_VAL(op_array->function_name))) {
+		++ic_static_materialize_rejects[1];
+		return;
+	}
+	if (!(decoded_opcode == ZEND_JMP ||
+	      decoded_opcode == ZEND_JMPZ ||
+	      decoded_opcode == ZEND_JMPNZ ||
+	      decoded_opcode == ZEND_JMPZNZ ||
+	      decoded_opcode == ZEND_JMPZ_EX ||
+	      decoded_opcode == ZEND_JMPNZ_EX ||
+	      decoded_opcode == ZEND_JMP_SET)) {
+		++ic_static_materialize_rejects[2];
+		return;
+	}
+	++ic_static_materialize_attempts;
+	if ((opline->extended_value & 0x200000u) != 0) {
+		++ic_static_materialize_rejects[3];
+		return;
+	}
+
+	desc_ptr = ic_lookup_desc(op_array);
+	desc = (const uint32_t *)desc_ptr;
+	if (!dasm_ic_committed_readable_ptr(desc) ||
+	    !dasm_ic_committed_readable_ptr(desc + 27)) {
+		++ic_static_materialize_rejects[4];
+		return;
+	}
+
+	runtime_meta = (const uint32_t *)(uintptr_t)desc[21];
+	if (!dasm_ic_committed_readable_ptr(runtime_meta) ||
+	    !dasm_ic_committed_readable_ptr(runtime_meta + (0x84u / sizeof(uint32_t))) ||
+	    !dasm_ic_committed_readable_ptr(runtime_meta + (0x7cu / sizeof(uint32_t)))) {
+		++ic_static_materialize_rejects[5];
+		return;
+	}
+	if (runtime_meta[0x84u / sizeof(uint32_t)] <= 8 ||
+	    runtime_meta[0x7cu / sizeof(uint32_t)] < 0x35u) {
+		++ic_static_materialize_rejects[5];
+		return;
+	}
+	op_array_flags = *(const uint32_t *)((const char *)op_array + 0x50);
+	if ((op_array_flags & 0x200000u) == 0) {
+		++ic_static_materialize_rejects[5];
+		return;
+	}
+
+	ctx = (const uint32_t *)((uintptr_t)desc + 0x1cu);
+	if (!dasm_ic_committed_readable_ptr(ctx)) {
+		++ic_static_materialize_rejects[5];
+		return;
+	}
+
+	base = (uintptr_t)op_array->opcodes;
+	last = (uint32_t)op_array->last;
+	op_addr = (uintptr_t)opline;
+	cur = (uint32_t)(opline - op_array->opcodes);
+
+	__try {
+		if (decoded_opcode == ZEND_JMP) {
+			jump_node = &opline->op1;
+		} else {
+			jump_node = &opline->op2;
+		}
+		old_target = (uintptr_t)jump_node->jmp_addr;
+
+		map_a = (uint32_t *)(uintptr_t)desc[25];
+		map_b = (uint32_t *)(uintptr_t)desc[26];
+		if (map_a && map_b &&
+		    dasm_ic_committed_readable_ptr(map_a + cur) &&
+		    dasm_ic_committed_readable_ptr(map_a + last - 1) &&
+		    dasm_ic_committed_readable_ptr(map_b + last - 1)) {
+			maps_ok = 1;
+		}
+
+		h0 = ctx[0];
+		h1 = ctx[1];
+		h2 = ctx[2];
+		h3 = ctx[3];
+		if (!dasm_ic_committed_readable_ptr((const void *)(uintptr_t)ctx[4]) ||
+		    !dasm_ic_committed_readable_ptr((const void *)(uintptr_t)ctx[5]) ||
+		    !dasm_ic_committed_readable_ptr((const void *)(uintptr_t)ctx[6]) ||
+		    !dasm_ic_committed_readable_ptr((const void *)(uintptr_t)ctx[7])) {
+			++ic_static_materialize_rejects[6];
+			return;
+		}
+		h4 = *(const uint32_t *)(uintptr_t)ctx[4];
+		h5 = *(const uint32_t *)(uintptr_t)ctx[5];
+		h6 = *(const uint32_t *)(uintptr_t)ctx[6];
+		h7 = *(const uint32_t *)(uintptr_t)ctx[7];
+		divisor = h0 + h1 + h2 + h3 + h4 + h5 + h6 + 17u;
+		if (divisor == 0) return;
+
+		if (old_target < base || old_target >= base + ((uintptr_t)last * sizeof(zend_op))) {
+			return;
+		}
+
+		current_base = op_addr;
+		if (maps_ok) {
+			current_base = op_addr - ((uintptr_t)sizeof(zend_op) * map_a[cur]);
+		}
+
+		if (old_target >= current_base) {
+			lower = current_base + sizeof(zend_op);
+			upper = base + ((uintptr_t)(last - 1) * sizeof(zend_op));
+			if (maps_ok) {
+				upper -= ((uintptr_t)sizeof(zend_op) * map_a[last - 1]);
+			}
+		} else {
+			lower = base;
+			if (current_base < base + sizeof(zend_op)) return;
+			upper = current_base - sizeof(zend_op);
+		}
+		if (upper < lower) return;
+		span = (uint32_t)(((upper - lower) / sizeof(zend_op)) + 1);
+		if (span == 0) return;
+
+		rot = (h0 + h1 + h2 + h3 + h4 + h5 + h6 + (h7 % divisor)) % span;
+		if (rot == 0) rot = 1;
+
+		new_target = old_target - ((uintptr_t)sizeof(zend_op) * rot);
+		if (new_target < lower) {
+			new_target = upper + ((uintptr_t)sizeof(zend_op) *
+				(1 - (int32_t)((lower - old_target) / sizeof(zend_op)) - (int32_t)rot));
+		}
+
+		if (maps_ok) {
+			uint32_t idx = (uint32_t)((new_target - base) / sizeof(zend_op));
+			if (idx > 0 && idx <= last && dasm_ic_committed_readable_ptr(map_b + idx - 1)) {
+				new_target += ((uintptr_t)sizeof(zend_op) * map_b[idx - 1]);
+			}
+		}
+		if (new_target < base || new_target >= base + ((uintptr_t)last * sizeof(zend_op))) {
+			return;
+		}
+
+		last_linear = (uint32_t)((new_target - base) / sizeof(zend_op));
+		jump_node->num = last_linear;
+		opline->extended_value |= 0x200000u;
+		++ic_static_materialize_success;
+	} __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void ic_force_loader_lazy_decode_all(zend_op_array *op_array)
+{
+	void *desc_ptr;
+	const uint32_t *desc;
+	DWORD old_ops = 0;
+	DWORD old_lits = 0;
+	DWORD old_flags = 0;
+	int unlocked_ops = 0;
+	int unlocked_lits = 0;
+	int unlocked_flags = 0;
+	uint32_t i;
+	int operand_materialize_enabled = 0;
+	int operand_materialize_name_ok = 1;
+
+	if (op_array == NULL || op_array->opcodes == NULL ||
+	    op_array->last == 0 || op_array->last >= 65536) {
+		return;
+	}
+
+	operand_materialize_enabled =
+		GetEnvironmentVariableA("OPCODEDUMP_IC_OPERAND_MATERIALIZE", NULL, 0) > 0;
+	if (operand_materialize_enabled &&
+	    GetEnvironmentVariableA("OPCODEDUMP_IC_OPERAND_MATERIALIZE_METHODS", NULL, 0) > 0) {
+		operand_materialize_name_ok = 0;
+		if (op_array->function_name &&
+		    dasm_ic_committed_readable_ptr(op_array->function_name) &&
+		    ic_env_list_contains_name("OPCODEDUMP_IC_OPERAND_MATERIALIZE_METHODS", ZSTR_VAL(op_array->function_name))) {
+			operand_materialize_name_ok = 1;
+		}
+	}
+
+	desc_ptr = ic_lookup_desc(op_array);
+	desc = (const uint32_t *)desc_ptr;
+	if (!dasm_ic_committed_readable_ptr(desc)) {
+		return;
+	}
+
+	/* sub_10073450 is the loader's lazy decode gate. It returns the decoded
+	 * opcode byte and, for flagged IS_CONST operands, mutates the pointed
+	 * literal zval in-place and clears desc[4][op_index].  Run it once over
+	 * the whole op_array before JSON emission so the literals table is dumped
+	 * after lazy metadata has been materialized, not before. */
+	unlocked_ops = VirtualProtect((LPVOID)op_array->opcodes,
+	    (SIZE_T)op_array->last * sizeof(zend_op), PAGE_EXECUTE_READWRITE, &old_ops);
+
+	if (op_array->literals && op_array->last_literal > 0 && op_array->last_literal < 65536) {
+		unlocked_lits = VirtualProtect((LPVOID)op_array->literals,
+		    (SIZE_T)op_array->last_literal * sizeof(zval), PAGE_EXECUTE_READWRITE, &old_lits);
+	}
+
+	__try {
+		if (desc[4] && dasm_ic_committed_readable_ptr((const void *)(uintptr_t)desc[4])) {
+			unlocked_flags = VirtualProtect((LPVOID)(uintptr_t)desc[4],
+			    (SIZE_T)op_array->last, PAGE_EXECUTE_READWRITE, &old_flags);
+		}
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		unlocked_flags = 0;
+	}
+
+	for (i = 0; i < op_array->last; ++i) {
+		__try {
+			zend_uchar decoded_opcode = 0;
+			if (dasm_ic_loader_lazy_decode_opcode(op_array, &op_array->opcodes[i], &decoded_opcode)) {
+				/* Keep the opcode byte itself untouched here.  sub_10073450 is
+				 * still used by dasm_zend_op() as the display oracle; writing the
+				 * decoded byte back while the descriptor still has opcode-XOR
+				 * enabled would make later reads XOR it a second time.  The call
+				 * above is intentionally made for its lazy side effects: flagged
+				 * IS_CONST operands are materialized in the literals table and the
+				 * per-op literal flag is cleared by the loader. */
+				(void)decoded_opcode;
+			}
+			if (decoded_opcode && operand_materialize_enabled && operand_materialize_name_ok) {
+				(void)dasm_ic_call_loader_operand_materializer(op_array, &op_array->opcodes[i], decoded_opcode);
+			}
+		} __except(EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
+	if (unlocked_flags) VirtualProtect((LPVOID)(uintptr_t)desc[4], (SIZE_T)op_array->last, old_flags, &old_flags);
+	if (unlocked_lits)  VirtualProtect((LPVOID)op_array->literals, (SIZE_T)op_array->last_literal * sizeof(zval), old_lits, &old_lits);
+	if (unlocked_ops)   VirtualProtect((LPVOID)op_array->opcodes, (SIZE_T)op_array->last * sizeof(zend_op), old_ops, &old_ops);
+}
+
+static void dasm_ic_materialize_dump_op_array(zend_op_array *op_array)
+{
+	DWORD old_ops = 0;
+	DWORD old_lits = 0;
+	int unlocked_ops = 0;
+	int unlocked_lits = 0;
+	uint32_t i;
+
+	if (op_array == NULL || op_array->opcodes == NULL ||
+	    op_array->last == 0 || op_array->last >= 65536) {
+		return;
+	}
+
+	unlocked_ops = VirtualProtect((LPVOID)op_array->opcodes,
+	    (SIZE_T)op_array->last * sizeof(zend_op), PAGE_EXECUTE_READWRITE, &old_ops);
+
+	if (op_array->literals && op_array->last_literal > 0 && op_array->last_literal < 65536) {
+		unlocked_lits = VirtualProtect((LPVOID)op_array->literals,
+		    (SIZE_T)op_array->last_literal * sizeof(zval), PAGE_EXECUTE_READWRITE, &old_lits);
+	}
+
+	for (i = 0; i < op_array->last; ++i) {
+		__try {
+			zend_uchar decoded_opcode = 0;
+			if (dasm_ic_loader_lazy_decode_opcode(op_array, &op_array->opcodes[i], &decoded_opcode) && decoded_opcode) {
+				(void)dasm_ic_call_loader_operand_materializer(op_array, &op_array->opcodes[i], decoded_opcode);
+			}
+		} __except(EXCEPTION_EXECUTE_HANDLER) {}
+	}
+
+	if (unlocked_lits) VirtualProtect((LPVOID)op_array->literals, (SIZE_T)op_array->last_literal * sizeof(zval), old_lits, &old_lits);
+	if (unlocked_ops)  VirtualProtect((LPVOID)op_array->opcodes, (SIZE_T)op_array->last * sizeof(zend_op), old_ops, &old_ops);
+}
+
+static void dasm_ic_set_decoded_handler(zend_op *opline)
+{
+	if (opline == NULL) return;
+	__try {
+		zend_vm_set_opcode_handler(opline);
+	} __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 static zend_uchar dasm_ic_display_opcode(const zend_op_array *op_array, const zend_op *opline,
                                           zend_uchar opcode)
 {
@@ -570,11 +1980,83 @@ static void inline dasm_zend_op(zval *dst, const zend_op_array *op_array, const 
 	zend_long op1_constant, op2_constant, result_constant;
 	zend_long op1_value, op2_value, result_value;
 	zend_uchar display_opcode;
+	uint8_t ic_literal_flags = 0;
+	uint32_t ic_literal_xor_key = 0;
 
 	raw_src        = src;
 	display_opcode = dasm_ic_display_opcode(op_array, src, src->opcode);
 	decoded_src    = *src;
 	decoded_src.opcode = display_opcode;
+#ifdef PHP_WIN32
+	{
+		zend_long op_index = (op_array && op_array->opcodes) ? (zend_long)(src - op_array->opcodes) : -1;
+		zend_uchar loader_opcode = 0;
+		int loader_opcode_ok = 0;
+		zend_uchar ic_key_byte = 0;
+		uint32_t ic_key_dword = 0;
+		if (dasm_ic_loader_lazy_decode_opcode(op_array, src, &loader_opcode)) {
+			loader_opcode_ok = 1;
+			display_opcode = loader_opcode;
+			decoded_src.opcode = loader_opcode;
+		}
+		if (dasm_ic_key_material_for_index(op_array, op_index, &ic_key_byte, &ic_key_dword)) {
+			uint32_t raw_handler = (uint32_t)(uintptr_t)src->handler;
+			uint32_t repeated = (uint32_t)ic_key_byte
+				| ((uint32_t)ic_key_byte << 8)
+				| ((uint32_t)ic_key_byte << 16)
+				| ((uint32_t)ic_key_byte << 24);
+			uint32_t decoded_handler = raw_handler ^ repeated;
+			add_assoc_long_ex(dst, ("ioncube_key_byte"), (sizeof("ioncube_key_byte")), ic_key_byte);
+			add_assoc_long_ex(dst, ("ioncube_key_dword"), (sizeof("ioncube_key_dword")), ic_key_dword);
+			add_assoc_long_ex(dst, ("ioncube_decoded_handler"), (sizeof("ioncube_decoded_handler")), decoded_handler);
+			if (GetEnvironmentVariableA("OPCODEDUMP_IC_DEBUG_OPERANDS", NULL, 0) > 0) {
+				uintptr_t loader_base = dasm_ic_loader_base();
+				uint32_t loader_size = dasm_ic_loader_size(loader_base);
+				add_assoc_long_ex(dst, ("ioncube_loader_base"), (sizeof("ioncube_loader_base")), (zend_long)loader_base);
+				add_assoc_long_ex(dst, ("ioncube_loader_size"), (sizeof("ioncube_loader_size")), (zend_long)loader_size);
+				if (loader_base != 0 &&
+				    decoded_handler >= (uint32_t)loader_base &&
+				    (loader_size == 0 || decoded_handler < (uint32_t)(loader_base + loader_size))) {
+					add_assoc_long_ex(dst, ("ioncube_decoded_handler_rva"), (sizeof("ioncube_decoded_handler_rva")),
+					                  (zend_long)(decoded_handler - (uint32_t)loader_base));
+				}
+				add_assoc_long_ex(dst, ("raw_opcode"), (sizeof("raw_opcode")), raw_src->opcode);
+				add_assoc_long_ex(dst, ("raw_lineno"), (sizeof("raw_lineno")), raw_src->lineno);
+				add_assoc_long_ex(dst, ("raw_extended_value"), (sizeof("raw_extended_value")), raw_src->extended_value);
+				add_assoc_long_ex(dst, ("raw_op1_type"), (sizeof("raw_op1_type")), raw_src->op1_type);
+				add_assoc_long_ex(dst, ("raw_op2_type"), (sizeof("raw_op2_type")), raw_src->op2_type);
+				add_assoc_long_ex(dst, ("raw_result_type"), (sizeof("raw_result_type")), raw_src->result_type);
+				add_assoc_long_ex(dst, ("raw_op1_num"), (sizeof("raw_op1_num")), raw_src->op1.num);
+				add_assoc_long_ex(dst, ("raw_op2_num"), (sizeof("raw_op2_num")), raw_src->op2.num);
+				add_assoc_long_ex(dst, ("raw_result_num"), (sizeof("raw_result_num")), raw_src->result.num);
+			}
+		}
+		(void)dasm_ic_literal_xor_for_index(op_array, op_index, &ic_literal_flags, &ic_literal_xor_key);
+		if (GetEnvironmentVariableA("OPCODEDUMP_IC_OPERAND_MATERIALIZE_INLINE", NULL, 0) > 0) {
+			uint32_t before_op1 = raw_src->op1.num;
+			uint32_t before_op2 = raw_src->op2.num;
+			uint32_t before_result = raw_src->result.num;
+			uint32_t before_lineno = raw_src->lineno;
+			int inline_result = dasm_ic_call_loader_operand_materializer((zend_op_array *)op_array, (zend_op *)raw_src, display_opcode);
+			add_assoc_long_ex(dst, ("ioncube_operand_inline_result"), (sizeof("ioncube_operand_inline_result")), inline_result);
+			add_assoc_long_ex(dst, ("ioncube_operand_inline_before_op1"), (sizeof("ioncube_operand_inline_before_op1")), before_op1);
+			add_assoc_long_ex(dst, ("ioncube_operand_inline_before_op2"), (sizeof("ioncube_operand_inline_before_op2")), before_op2);
+			add_assoc_long_ex(dst, ("ioncube_operand_inline_before_result"), (sizeof("ioncube_operand_inline_before_result")), before_result);
+			add_assoc_long_ex(dst, ("ioncube_operand_inline_before_lineno"), (sizeof("ioncube_operand_inline_before_lineno")), before_lineno);
+			decoded_src = *raw_src;
+			decoded_src.opcode = display_opcode;
+		}
+		dasm_ic_set_decoded_handler(&decoded_src);
+		if (GetEnvironmentVariableA("OPCODEDUMP_STATIC_JUMP_MATERIALIZE", NULL, 0) > 0) {
+			__try {
+				(void)loader_opcode_ok;
+				dasm_ic_loader_materialize_jump_operand((zend_op_array *)op_array, (zend_op *)raw_src, display_opcode);
+				decoded_src = *raw_src;
+				decoded_src.opcode = display_opcode;
+			} __except(EXCEPTION_EXECUTE_HANDLER) {}
+		}
+	}
+#endif
 	src = &decoded_src;
 
 	op1_type_name    = dasm_znode_type_name(src->op1_type);
@@ -613,8 +2095,14 @@ static void inline dasm_zend_op(zval *dst, const zend_op_array *op_array, const 
 	if (op2_type_name)    add_assoc_string(dst, "op2_type_name",    (char *)op2_type_name);
 	if (result_type_name) add_assoc_string(dst, "result_type_name", (char *)result_type_name);
 
-	dasm_add_literal(dst, "op1.literal",    op_array, src->op1_type,    src->op1);
-	dasm_add_literal(dst, "op2.literal",    op_array, src->op2_type,    src->op2);
+	dasm_add_literal_maybe_ic_decoded(dst, "op1.literal", op_array, src->opcode, src->op1_type,
+	                                  src->op1,
+	                                  (ic_literal_flags & 1u) != 0 && src->op1_type == IS_CONST,
+	                                  ic_literal_xor_key);
+	dasm_add_literal_maybe_ic_decoded(dst, "op2.literal", op_array, src->opcode, src->op2_type,
+	                                  src->op2,
+	                                  (ic_literal_flags & 2u) != 0 && src->op2_type == IS_CONST,
+	                                  ic_literal_xor_key);
 	dasm_add_literal(dst, "result.literal", op_array, src->result_type, src->result);
 
 	dasm_add_cv_name(dst, "op1.cv_name",    op_array, src->op1_type,    src->op1);
@@ -658,6 +2146,29 @@ static void inline dasm_zend_op(zval *dst, const zend_op_array *op_array, const 
 		}
 #endif
 		add_assoc_long(dst, "jmpznz_true_opline", ev_index);
+	}
+
+	/* PHP 7.2 FE_FETCH_R/RW stores the foreach-exit jump in extended_value,
+	 * while op2 is the destination CV/VAR. Treating op2 as a jump target
+	 * produces out-of-range CFG edges (e.g. target 96 in a 44-op function). */
+	if (display_opcode == ZEND_FE_FETCH_R || display_opcode == ZEND_FE_FETCH_RW) {
+		zend_long ev_index = -1;
+		zend_long current_index = (op_array && op_array->opcodes && raw_src)
+			? (zend_long)(raw_src - op_array->opcodes) : -1;
+#if ZEND_USE_ABS_JMP_ADDR
+		ev_index = dasm_index_from_address_base(
+			(uintptr_t)(uint32_t)raw_src->extended_value,
+			(uintptr_t)op_array->opcodes, op_array->last);
+#endif
+		if (ev_index < 0 && current_index >= 0 &&
+		    (raw_src->extended_value % sizeof(zend_op)) == 0) {
+			zend_long rel = (zend_long)(raw_src->extended_value / sizeof(zend_op));
+			zend_long candidate = current_index + rel;
+			if (candidate >= 0 && candidate < (zend_long)op_array->last) {
+				ev_index = candidate;
+			}
+		}
+		add_assoc_long(dst, "fe_fetch_done_opline", ev_index);
 	}
 }
 
@@ -1124,6 +2635,7 @@ static void inline dasm_class_table(zval *dst, const HashTable *src)
 void dasm_zend_op_array(zval *dst, const zend_op_array *src)
 {
 	zend_op_array _ic_fixup;
+	int _ic_used_runtime_capture = 0;
 
 	/* ionCube sentinel: opcodes field is a small odd integer before decode */
 	if (src && src->opcodes && ((uintptr_t)(src->opcodes) & 3)) {
@@ -1196,7 +2708,26 @@ void dasm_zend_op_array(zval *dst, const zend_op_array *src)
 	}
 #endif
 
+#ifdef PHP_WIN32
+	if (src && ic_runtime_capture_enabled()) {
+		zend_op *_captured_ops = NULL;
+		uint32_t _captured_last = 0;
+		__try {
+			if (ic_runtime_capture_lookup(src, &_captured_ops, &_captured_last)) {
+				_ic_fixup = *src;
+				_ic_fixup.opcodes = _captured_ops;
+				_ic_fixup.last = _captured_last;
+				src = &_ic_fixup;
+				_ic_used_runtime_capture = 1;
+			}
+		} __except(EXCEPTION_EXECUTE_HANDLER) {}
+	}
+#endif
+
 	add_assoc_long_ex(dst, ("type"), (sizeof("type")), src->type);
+	if (_ic_used_runtime_capture) {
+		add_assoc_string(dst, "ioncube_decode_source", "runtime_step2_capture");
+	}
 
 	if (src->function_name == NULL) {
 		add_assoc_null(dst, "function_name");
@@ -1231,6 +2762,124 @@ void dasm_zend_op_array(zval *dst, const zend_op_array *src)
 	}
 
 	add_assoc_long_ex(dst, ("fn_flags"), (sizeof("fn_flags")), dasm_normalize_fn_flags(src->fn_flags));
+
+#ifdef PHP_WIN32
+	if (src && src->reserved[3]) {
+		__try {
+			const uint32_t *_desc = (const uint32_t *)src->reserved[3];
+			if (dasm_ic_committed_readable_ptr(_desc) &&
+			    dasm_ic_committed_readable_ptr(_desc + 27)) {
+				zval _ic;
+				uint32_t _runtime_flags = 0;
+				array_init(&_ic);
+				add_assoc_long(&_ic, "desc", (zend_long)(uintptr_t)_desc);
+				add_assoc_long(&_ic, "key_index", _desc[1]);
+				add_assoc_long(&_ic, "literal_flags", _desc[4]);
+				add_assoc_long(&_ic, "encoded_opcodes", _desc[5]);
+				add_assoc_long(&_ic, "sentinel_opcodes", _desc[6]);
+				add_assoc_long(&_ic, "decoded_base", _desc[15]);
+				add_assoc_long(&_ic, "line_key", _desc[17]);
+				add_assoc_long(&_ic, "callback_ctx", _desc[19]);
+				add_assoc_long(&_ic, "runtime_meta", _desc[21]);
+				add_assoc_long(&_ic, "saved_last", _desc[27]);
+				if (_desc[21] &&
+				    dasm_ic_committed_readable_ptr((const void *)(uintptr_t)_desc[21]) &&
+				    dasm_ic_committed_readable_ptr((const void *)((uintptr_t)_desc[21] + 112))) {
+					_runtime_flags = *(const uint32_t *)((uintptr_t)_desc[21] + 112);
+				}
+				add_assoc_long(&_ic, "runtime_flags", _runtime_flags);
+				if (GetEnvironmentVariableA("OPCODEDUMP_IC_DEBUG_DESC", NULL, 0) > 0) {
+					zval _words;
+					int _di;
+					void *_captured_ctx = ic_lookup_callback_ctx((zend_op_array *)src, (void *)_desc);
+					uint32_t _same_key_count = 0;
+					uint32_t _same_last_count = 0;
+					zval _ctx_candidates;
+					add_assoc_long(&_ic, "callback_ctx_count", ic_callback_ctx_count);
+					add_assoc_long(&_ic, "captured_callback_ctx", (zend_long)(uintptr_t)_captured_ctx);
+					array_init(&_ctx_candidates);
+					for (_di = 0; _di < (int)ic_callback_ctx_count && _di < 512; ++_di) {
+						const uint32_t *_cd = (const uint32_t *)ic_callback_ctx_desc[_di];
+						if (dasm_ic_committed_readable_ptr(_cd) &&
+						    dasm_ic_committed_readable_ptr((const char *)_cd + 0x6c)) {
+							if (_cd[1] == _desc[1]) {
+								zval _cand;
+								++_same_key_count;
+								if (_same_key_count <= 12) {
+									array_init(&_cand);
+									add_assoc_long(&_cand, "desc", (zend_long)(uintptr_t)_cd);
+									add_assoc_long(&_cand, "ctx", (zend_long)(uintptr_t)ic_callback_ctx_ctx[_di]);
+									add_assoc_long(&_cand, "key_index", _cd[1]);
+									add_assoc_long(&_cand, "encoded_opcodes", _cd[5]);
+									add_assoc_long(&_cand, "decoded_base", _cd[15]);
+									add_assoc_long(&_cand, "line_key", _cd[17]);
+									add_assoc_long(&_cand, "saved_last", _cd[27]);
+									add_next_index_zval(&_ctx_candidates, &_cand);
+								}
+							}
+							if (_cd[27] == _desc[27]) ++_same_last_count;
+						}
+					}
+					add_assoc_long(&_ic, "callback_ctx_same_key_count", _same_key_count);
+					add_assoc_long(&_ic, "callback_ctx_same_last_count", _same_last_count);
+					add_assoc_zval(&_ic, "callback_ctx_candidates", &_ctx_candidates);
+					add_assoc_long(&_ic, "operand_materialize_attempts", ic_operand_materialize_attempts);
+					add_assoc_long(&_ic, "operand_materialize_success", ic_operand_materialize_success);
+					{
+						zval _om_rejects;
+						array_init(&_om_rejects);
+						for (_di = 0; _di < 8; ++_di) {
+							add_next_index_long(&_om_rejects, ic_operand_materialize_rejects[_di]);
+						}
+						add_assoc_zval(&_ic, "operand_materialize_rejects", &_om_rejects);
+					}
+					array_init(&_words);
+					for (_di = 0; _di < 32; ++_di) {
+						add_next_index_long(&_words, _desc[_di]);
+					}
+					add_assoc_zval(&_ic, "desc_words", &_words);
+					if (_desc[4] && dasm_ic_committed_readable_ptr((const void *)(uintptr_t)_desc[4])) {
+						zval _flags;
+						const uint8_t *_fb = (const uint8_t *)(uintptr_t)_desc[4];
+						int _fi, _limit = src->last < 256 ? (int)src->last : 256;
+						array_init(&_flags);
+						for (_fi = 0; _fi < _limit; ++_fi) {
+							add_next_index_long(&_flags, _fb[_fi]);
+						}
+						add_assoc_zval(&_ic, "literal_flag_bytes", &_flags);
+					}
+					if (_desc[17] && dasm_ic_committed_readable_ptr((const void *)(uintptr_t)_desc[17])) {
+						zval _line_words;
+						const uint32_t *_lw = (const uint32_t *)(uintptr_t)_desc[17];
+						int _li;
+						array_init(&_line_words);
+						for (_li = 0; _li < 32; ++_li) {
+							if (!dasm_ic_committed_readable_ptr(_lw + _li)) break;
+							add_next_index_long(&_line_words, _lw[_li]);
+						}
+						add_assoc_zval(&_ic, "line_key_words", &_line_words);
+					}
+					if (_desc[21] && dasm_ic_committed_readable_ptr((const void *)(uintptr_t)_desc[21])) {
+						zval _meta_words;
+						const uint32_t *_mw = (const uint32_t *)(uintptr_t)_desc[21];
+						int _mi;
+						array_init(&_meta_words);
+						for (_mi = 0; _mi < 40; ++_mi) {
+							if (!dasm_ic_committed_readable_ptr(_mw + _mi)) break;
+							add_next_index_long(&_meta_words, _mw[_mi]);
+						}
+						add_assoc_zval(&_ic, "runtime_meta_words", &_meta_words);
+					}
+				}
+				add_assoc_zval(dst, "ioncube_descriptor", &_ic);
+			}
+		} __except(EXCEPTION_EXECUTE_HANDLER) {}
+	}
+#endif
+
+#ifdef PHP_WIN32
+	dasm_ic_materialize_dump_op_array((zend_op_array *)src);
+#endif
 
 	if (src->arg_info && src->num_args > 0 && src->num_args < 256
 #ifdef PHP_WIN32
@@ -1556,7 +3205,7 @@ void dasm_zend_op_array(zval *dst, const zend_op_array *src)
 					_vm = 1;
 				} __except(EXCEPTION_EXECUTE_HANDLER) { _vm = 0; }
 				if (_vm && _vname) {
-					add_next_index_stringl(&arr, _vname, _vname_len);
+					dasm_add_next_var_name_stringl(&arr, _vname, _vname_len);
 				} else {
 					add_next_index_null(&arr);
 				}
@@ -1572,7 +3221,7 @@ void dasm_zend_op_array(zval *dst, const zend_op_array *src)
 		zval arr;
 		array_init(&arr);
 		for (i = 0; i < src->last_var; ++i) {
-			add_next_index_string(&arr, ZSTR_VAL(src->vars[i]));
+			dasm_add_next_var_name_stringl(&arr, ZSTR_VAL(src->vars[i]), ZSTR_LEN(src->vars[i]));
 		}
 		add_assoc_zval_ex(dst, ("vars"), (sizeof("vars")), &arr);
 	} else {
@@ -1785,9 +3434,13 @@ static void ic_force_decode_op_array(zend_op_array *oa, uintptr_t loader_base)
 	uint32_t ic_flags = *(uint32_t *)((char *)oa + 80);   /* try_catch_array raw bits */
 	int has_step2_marker = (ic_flags & 0x400000u) != 0;
 	int has_odd_opcode_sentinel = (oa->opcodes && (((uintptr_t)oa->opcodes) & 3)) != 0;
-	if (!ic_desc || (!has_step2_marker && !has_odd_opcode_sentinel)) return;
+	if (!ic_desc) return;
 	if (!dasm_ic_committed_readable_ptr(ic_desc) ||
 	    !dasm_ic_committed_readable_ptr((const char *)ic_desc + 0x6c)) {
+		return;
+	}
+	if (!has_step2_marker && !has_odd_opcode_sentinel) {
+		ic_runtime_capture_op_array(oa);
 		return;
 	}
 
@@ -1795,17 +3448,36 @@ static void ic_force_decode_op_array(zend_op_array *oa, uintptr_t loader_base)
 	fn_t step1 = (fn_t)(loader_base + IC_STEP1_RVA);
 	fn_t step2 = (fn_t)(loader_base + IC_STEP2_RVA);
 	zend_op *decoded_ops = NULL;
+	zend_op *runtime_ops = NULL;
 	zend_op *restored_ops = NULL;
 	uint32_t saved_last = oa->last;
 	int can_call_step1 = 0;
+	uint32_t original_callback_ctx = 0;
+	uint32_t injected_callback_ctx = 0;
+	int injected_desc19 = 0;
+	DWORD desc_old_protect = 0;
 
 	/* descriptor[19] is NULL for some op_arrays before runtime dispatch.
-	 * step1 dereferences it unconditionally, so use it only as a protected
-	 * gate for step1. */
+	 * step1 dereferences it unconditionally.  Capture desc[19] earlier from
+	 * the loader setter and temporarily restore it here so dump-time decode
+	 * follows the same path as runtime dispatch. */
 	__try {
-		const uint32_t *desc = (const uint32_t *)ic_desc;
+		uint32_t *desc = (uint32_t *)ic_desc;
 		uint32_t fn_ptr_val = desc[19];
-		can_call_step1 = (fn_ptr_val != 0);
+		original_callback_ctx = fn_ptr_val;
+		if (fn_ptr_val == 0) {
+			void *ctx = ic_lookup_callback_ctx(oa, ic_desc);
+			if (ctx) {
+				injected_callback_ctx = (uint32_t)(uintptr_t)ctx;
+				if (VirtualProtect(desc, 0x80, PAGE_EXECUTE_READWRITE, &desc_old_protect) ||
+				    VirtualProtect(desc, 0x80, PAGE_READWRITE, &desc_old_protect)) {
+					desc[19] = injected_callback_ctx;
+					injected_desc19 = 1;
+					fn_ptr_val = injected_callback_ctx;
+				}
+			}
+		}
+		can_call_step1 = (fn_ptr_val != 0 && ic_callback_ctx_is_plausible((void *)(uintptr_t)fn_ptr_val));
 		if (saved_last == 0) saved_last = desc[27];
 		if (saved_last == 0 && fn_ptr_val) {
 			const uint32_t *fn_ptr = (const uint32_t *)fn_ptr_val;
@@ -1832,9 +3504,27 @@ static void ic_force_decode_op_array(zend_op_array *oa, uintptr_t loader_base)
 			decoded_ops = NULL;
 		}
 	}
+	if (injected_desc19) {
+		__try {
+			((uint32_t *)ic_desc)[19] = original_callback_ctx;
+			VirtualProtect(ic_desc, 0x80, desc_old_protect, &desc_old_protect);
+		} __except(EXCEPTION_EXECUTE_HANDLER) {}
+	}
 
 	if (has_step2_marker) {
 		__try { step2(oa); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+		/* Prefer the loader's post-step2 state as runtime truth.  This is
+		 * the same window used by dispatch before the op_array is hidden
+		 * again by sub_10062970 after execution. */
+		__try {
+			if (oa->opcodes && oa->last > 0 && oa->last < 65536 &&
+			    dasm_ic_committed_readable_ptr(oa->opcodes) &&
+			    dasm_ic_committed_readable_ptr(oa->opcodes + oa->last - 1)) {
+				runtime_ops = oa->opcodes;
+			}
+		} __except(EXCEPTION_EXECUTE_HANDLER) {
+			runtime_ops = NULL;
+		}
 	}
 
 	/* Some compile-time op_arrays have descriptor[19] == NULL, so step1
@@ -1856,9 +3546,12 @@ static void ic_force_decode_op_array(zend_op_array *oa, uintptr_t loader_base)
 		}
 	}
 
-	/* After step1, byte 40 has the dispatch opline pointer.  For op_arrays
-	 * without runtime state, use the descriptor-based step2 fallback instead. */
-	if (decoded_ops) oa->opcodes = decoded_ops;
+	/* Runtime truth order:
+	 *   1. post-step2 op_array state (same state dispatch executes)
+	 *   2. pre-step2 dispatch opline pointer captured from step1
+	 *   3. descriptor formula fallback for compile-time-only op_arrays */
+	if (runtime_ops) oa->opcodes = runtime_ops;
+	else if (decoded_ops) oa->opcodes = decoded_ops;
 	else if (restored_ops) oa->opcodes = restored_ops;
 	if (oa->last == 0) {
 		if (saved_last > 0 && saved_last < 65536) oa->last = saved_last;
@@ -1870,7 +3563,24 @@ static void ic_force_decode_op_array(zend_op_array *oa, uintptr_t loader_base)
 		} __except(EXCEPTION_EXECUTE_HANDLER) {}
 	}
 
-	__try { ic_decode_marked_const_literals(oa); } __except(EXCEPTION_EXECUTE_HANDLER) {}
+	/* Force the loader's per-opcode lazy decode path over the entire stream.
+	 * First try the loader's full materialization pass (sub_100626F0), then
+	 * fall back to the per-op lazy gate (sub_10073450).  Opcode bytes are
+	 * still read through the loader oracle later, while literal zvals/flags
+	 * are made consistent now, before the op_array's literals table is
+	 * emitted. */
+	dasm_ic_call_global_literal_materializer(oa);
+	ic_force_loader_lazy_decode_all(oa);
+
+	/* dasm_file() compiles methods without executing them, so the detour is
+	 * not guaranteed to see every method.  Store the post-step2/manual-decode
+	 * state explicitly as the dump source of truth. */
+	ic_runtime_capture_op_array(oa);
+
+	/* ic_decode_marked_const_literals disabled: uses wrong XOR key (last_literal+1 instead
+	 * of request_key + raw_line_start + desc[17]).  Re-enable only after IC_KEY_TABLE_RVA
+	 * is identified and the correct per-literal key formula is confirmed. */
+	/* __try { ic_decode_marked_const_literals(oa); } __except(EXCEPTION_EXECUTE_HANDLER) {} */
 
 	if (!oa->reserved[2] && ic_desc) {
 		__try {
@@ -1905,6 +3615,70 @@ static void ic_force_decode_all(uintptr_t loader_base)
 		} ZEND_HASH_FOREACH_END();
 	}
 }
+
+static void dasm_ioncube_jump_log(zval *dst)
+{
+	uint32_t i;
+	array_init(dst);
+	for (i = 0; i < ic_jump_log_count; ++i) {
+		ic_jump_log_entry *entry = &ic_jump_log[i];
+		uint32_t before_op1_index = 0xffffffffu;
+		uint32_t before_op2_index = 0xffffffffu;
+		uint32_t after_op1_index = 0xffffffffu;
+		uint32_t after_op2_index = 0xffffffffu;
+		zval zv;
+		__try {
+			if (entry->op_array && entry->op_array->opcodes && entry->op_array->last < 65536) {
+				uintptr_t base = (uintptr_t)entry->op_array->opcodes;
+				uintptr_t end = base + ((uintptr_t)entry->op_array->last * sizeof(zend_op));
+				if ((uintptr_t)entry->before_op1 >= base && (uintptr_t)entry->before_op1 < end &&
+				    (((uintptr_t)entry->before_op1 - base) % sizeof(zend_op)) == 0) {
+					before_op1_index = (uint32_t)(((uintptr_t)entry->before_op1 - base) / sizeof(zend_op));
+				}
+				if ((uintptr_t)entry->before_op2 >= base && (uintptr_t)entry->before_op2 < end &&
+				    (((uintptr_t)entry->before_op2 - base) % sizeof(zend_op)) == 0) {
+					before_op2_index = (uint32_t)(((uintptr_t)entry->before_op2 - base) / sizeof(zend_op));
+				}
+				if ((uintptr_t)entry->after_op1 >= base && (uintptr_t)entry->after_op1 < end &&
+				    (((uintptr_t)entry->after_op1 - base) % sizeof(zend_op)) == 0) {
+					after_op1_index = (uint32_t)(((uintptr_t)entry->after_op1 - base) / sizeof(zend_op));
+				}
+				if ((uintptr_t)entry->after_op2 >= base && (uintptr_t)entry->after_op2 < end &&
+				    (((uintptr_t)entry->after_op2 - base) % sizeof(zend_op)) == 0) {
+					after_op2_index = (uint32_t)(((uintptr_t)entry->after_op2 - base) / sizeof(zend_op));
+				}
+			}
+		} __except(EXCEPTION_EXECUTE_HANDLER) {}
+		array_init(&zv);
+		add_assoc_long_ex(&zv, ("op_array"), sizeof("op_array"), (zend_long)(uintptr_t)entry->op_array);
+		add_assoc_long_ex(&zv, ("desc"), sizeof("desc"), (zend_long)(uintptr_t)entry->desc);
+		add_assoc_long_ex(&zv, ("opline"), sizeof("opline"), (zend_long)(uintptr_t)entry->opline);
+		add_assoc_long_ex(&zv, ("index"), sizeof("index"), entry->index);
+		add_assoc_long_ex(&zv, ("opcode"), sizeof("opcode"), entry->opcode);
+		add_assoc_long_ex(&zv, ("before_op1"), sizeof("before_op1"), entry->before_op1);
+		add_assoc_long_ex(&zv, ("before_op2"), sizeof("before_op2"), entry->before_op2);
+		add_assoc_long_ex(&zv, ("after_op1"), sizeof("after_op1"), entry->after_op1);
+		add_assoc_long_ex(&zv, ("after_op2"), sizeof("after_op2"), entry->after_op2);
+		add_assoc_long_ex(&zv, ("before_ext"), sizeof("before_ext"), entry->before_ext);
+		add_assoc_long_ex(&zv, ("after_ext"), sizeof("after_ext"), entry->after_ext);
+		add_assoc_long_ex(&zv, ("before_op1_index"), sizeof("before_op1_index"), before_op1_index);
+		add_assoc_long_ex(&zv, ("before_op2_index"), sizeof("before_op2_index"), before_op2_index);
+		add_assoc_long_ex(&zv, ("after_op1_index"), sizeof("after_op1_index"), after_op1_index);
+		add_assoc_long_ex(&zv, ("after_op2_index"), sizeof("after_op2_index"), after_op2_index);
+		add_assoc_long_ex(&zv, ("ctx"), sizeof("ctx"), entry->ctx);
+		add_assoc_long_ex(&zv, ("map_a"), sizeof("map_a"), entry->map_a);
+		add_assoc_long_ex(&zv, ("map_b"), sizeof("map_b"), entry->map_b);
+		__try {
+			if (entry->op_array && entry->op_array->function_name &&
+			    dasm_ic_committed_readable_ptr(entry->op_array->function_name)) {
+				add_assoc_stringl(&zv, "function_name",
+				                  ZSTR_VAL(entry->op_array->function_name),
+				                  ZSTR_LEN(entry->op_array->function_name));
+			}
+		} __except(EXCEPTION_EXECUTE_HANDLER) {}
+		add_next_index_zval(dst, &zv);
+	}
+}
 #endif /* PHP_WIN32 */
 
 /* ============================================================
@@ -1936,6 +3710,8 @@ PHP_FUNCTION(dasm_file)
 		HMODULE hLoader = GetModuleHandleA(IC_LOADER_NAME);
 		if (hLoader) {
 			loader_base = (uintptr_t)hLoader;
+			ic_install_callback_ctx_hook(loader_base);
+			ic_install_step2_hook(loader_base);
 		}
 	}
 #endif
@@ -1993,7 +3769,6 @@ PHP_FUNCTION(dasm_file)
 	} else {
 		add_assoc_null_ex(return_value, ("class_table"), (sizeof("class_table")));
 	}
-
 	zval_ptr_dtor(&zfilename);
 }
 
@@ -2040,6 +3815,102 @@ PHP_FUNCTION(dasm_string)
 	}
 }
 
+#ifdef ZEND_BEGIN_ARG_INFO_EX
+ZEND_BEGIN_ARG_INFO_EX(arginfo_dasm_current, 0, 0, 0)
+ZEND_END_ARG_INFO()
+#else
+static unsigned char arginfo_dasm_current[] = { 0, BYREF_NONE };
+#endif
+
+#ifdef ZEND_BEGIN_ARG_INFO_EX
+ZEND_BEGIN_ARG_INFO_EX(arginfo_dasm_install_hooks, 0, 0, 0)
+ZEND_END_ARG_INFO()
+#else
+static unsigned char arginfo_dasm_install_hooks[] = { 0, BYREF_NONE };
+#endif
+
+PHP_FUNCTION(dasm_install_hooks)
+{
+#ifdef PHP_WIN32
+	HMODULE hLoader = GetModuleHandleA(IC_LOADER_NAME);
+	int ok_step2 = 0;
+	int ok_jump = 0;
+	int ok_callback_ctx = 0;
+	int ok_hide_op_array = 0;
+	if (hLoader) {
+		uintptr_t loader_base = (uintptr_t)hLoader;
+		ok_callback_ctx = ic_install_callback_ctx_hook(loader_base);
+		ok_step2 = ic_install_step2_hook(loader_base);
+		ok_jump = ic_install_jump_hook(loader_base);
+	}
+	array_init(return_value);
+	add_assoc_bool(return_value, "hide_op_array_bypass", ok_hide_op_array ? 1 : 0);
+	add_assoc_bool(return_value, "callback_ctx", ok_callback_ctx ? 1 : 0);
+	add_assoc_bool(return_value, "step2", ok_step2 ? 1 : 0);
+	add_assoc_bool(return_value, "jump_materialize", ok_jump ? 1 : 0);
+	add_assoc_long_ex(return_value, ("jump_log_count"), sizeof("jump_log_count"), ic_jump_log_count);
+	add_assoc_long_ex(return_value, ("jump_seen_count"), sizeof("jump_seen_count"), ic_jump_seen_count);
+#else
+	RETURN_FALSE;
+#endif
+}
+
+PHP_FUNCTION(dasm_current)
+{
+#ifdef PHP_WIN32
+	uintptr_t loader_base = 0;
+	{
+		HMODULE hLoader = GetModuleHandleA(IC_LOADER_NAME);
+		if (hLoader) {
+			loader_base = (uintptr_t)hLoader;
+			ic_install_callback_ctx_hook(loader_base);
+			ic_install_step2_hook(loader_base);
+			ic_install_jump_hook(loader_base);
+			ic_force_decode_all(loader_base);
+		}
+	}
+#endif
+
+	array_init(return_value);
+
+	if (CG(function_table)) {
+		zval _zv;
+		array_init(&_zv);
+		dasm_function_table(&_zv, CG(function_table));
+		add_assoc_zval_ex(return_value, ("function_table"), (sizeof("function_table")), &_zv);
+	} else if (EG(function_table)) {
+		zval _zv;
+		array_init(&_zv);
+		dasm_function_table(&_zv, EG(function_table));
+		add_assoc_zval_ex(return_value, ("function_table"), (sizeof("function_table")), &_zv);
+	} else {
+		add_assoc_null_ex(return_value, ("function_table"), (sizeof("function_table")));
+	}
+
+	if (CG(class_table)) {
+		zval _zv;
+		array_init(&_zv);
+		dasm_class_table(&_zv, CG(class_table));
+		add_assoc_zval_ex(return_value, ("class_table"), (sizeof("class_table")), &_zv);
+	} else if (EG(class_table)) {
+		zval _zv;
+		array_init(&_zv);
+		dasm_class_table(&_zv, EG(class_table));
+		add_assoc_zval_ex(return_value, ("class_table"), (sizeof("class_table")), &_zv);
+	} else {
+		add_assoc_null_ex(return_value, ("class_table"), (sizeof("class_table")));
+	}
+
+#ifdef PHP_WIN32
+	{
+		zval _jump_log;
+		dasm_ioncube_jump_log(&_jump_log);
+		add_assoc_zval_ex(return_value, ("ioncube_jump_materializations"), sizeof("ioncube_jump_materializations"), &_jump_log);
+		add_assoc_long_ex(return_value, ("ioncube_jump_seen_count"), sizeof("ioncube_jump_seen_count"), ic_jump_seen_count);
+	}
+#endif
+}
+
 PHP_MINIT_FUNCTION(opcodedump)    { return SUCCESS; }
 PHP_MSHUTDOWN_FUNCTION(opcodedump){ return SUCCESS; }
 
@@ -2051,7 +3922,15 @@ PHP_RINIT_FUNCTION(opcodedump)
 	return SUCCESS;
 }
 
-PHP_RSHUTDOWN_FUNCTION(opcodedump){ return SUCCESS; }
+PHP_RSHUTDOWN_FUNCTION(opcodedump)
+{
+#ifdef PHP_WIN32
+	ic_runtime_capture_clear();
+	ic_jump_log_clear();
+	ic_callback_ctx_count = 0;
+#endif
+	return SUCCESS;
+}
 
 PHP_MINFO_FUNCTION(opcodedump)
 {
@@ -2063,6 +3942,8 @@ PHP_MINFO_FUNCTION(opcodedump)
 const zend_function_entry opcodedump_functions[] = {
 	PHP_FE(dasm_file,   arginfo_dasm_file)
 	PHP_FE(dasm_string, arginfo_dasm_string)
+	PHP_FE(dasm_install_hooks, arginfo_dasm_install_hooks)
+	PHP_FE(dasm_current, arginfo_dasm_current)
 	PHP_FE_END
 };
 
