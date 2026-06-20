@@ -411,6 +411,65 @@ static zend_long dasm_operand_value(const zend_op_array *op_array, const zend_op
 	return (zend_long)operand.var;
 }
 
+/* Decode a target stored in extended_value.  PHP 7.2 uses this for
+ * ZEND_JMPZNZ's second branch and FE_FETCH_R/RW's foreach-exit branch.
+ * Export this as an explicit target index; do not overload op*.opline_num. */
+static zend_long dasm_extended_target_index(const zend_op_array *op_array,
+                                            const zend_op *opline,
+                                            uint32_t extended_value)
+{
+	zend_long current_index;
+	zend_long target_index = -1;
+
+	if (op_array == NULL || op_array->opcodes == NULL || opline == NULL ||
+	    op_array->last == 0 || extended_value == 0) {
+		return -1;
+	}
+
+	current_index = (zend_long)(opline - op_array->opcodes);
+	if (current_index < 0 || current_index >= (zend_long)op_array->last) {
+		return -1;
+	}
+
+#if ZEND_USE_ABS_JMP_ADDR
+	target_index = dasm_index_from_address_base(
+		(uintptr_t)(uint32_t)extended_value,
+		(uintptr_t)op_array->opcodes, op_array->last);
+	if (target_index >= 0) return target_index;
+#endif
+
+	/* Some protected streams store the already-materialized linear opline
+	 * number in extended_value.  Accept it only when it is in range. */
+	if (extended_value < op_array->last) {
+		return (zend_long)extended_value;
+	}
+
+	/* Normal non-absolute build: relative byte offset from current opline.
+	 * Keep this fallback on Windows too because some materializers rewrite to
+	 * relative-byte form before the dumper sees the op. */
+	if ((extended_value % sizeof(zend_op)) == 0) {
+		zend_long rel = (zend_long)((int32_t)extended_value / (int32_t)sizeof(zend_op));
+		zend_long candidate = current_index + rel;
+		if (candidate >= 0 && candidate < (zend_long)op_array->last) {
+			return candidate;
+		}
+	}
+
+	return -1;
+}
+
+static void dasm_add_jump_target_entry(zval *targets, const char *kind,
+                                       int operand_index, zend_long target_index)
+{
+	zval entry;
+	if (target_index < 0) return;
+	array_init(&entry);
+	add_assoc_string(&entry, "kind", (char *)kind);
+	add_assoc_long(&entry, "operand", operand_index);
+	add_assoc_long(&entry, "target_index", target_index);
+	add_next_index_zval(targets, &entry);
+}
+
 static void dasm_add_literal(zval *dst, const char *key,
                               const zend_op_array *op_array, zend_uchar type, znode_op operand)
 {
@@ -2127,48 +2186,88 @@ static void inline dasm_zend_op(zval *dst, const zend_op_array *op_array, const 
 	add_assoc_long_ex(dst, ("op2.opline_num"),     (sizeof("op2.opline_num")),     op2_value);
 	add_assoc_long(dst, "handler", (zend_long)(uintptr_t)src->handler);
 
+	/* Reliable CFG metadata.  Older consumers may still read op*.opline_num,
+	 * but decompilers should prefer these explicit fields. */
+	{
+		zend_long op_index = (op_array && op_array->opcodes && raw_src)
+			? (zend_long)(raw_src - op_array->opcodes) : -1;
+		zend_long op1_target = dasm_jump_target_index(op_array, raw_src, display_opcode, 1, src->op1);
+		zend_long op2_target = dasm_jump_target_index(op_array, raw_src, display_opcode, 2, src->op2);
+		zend_long ext_target = -1;
+		zval jump_targets;
+
+		add_assoc_long(dst, "op_index", op_index);
+		if (op_index >= 0 && op_index + 1 < (zend_long)op_array->last) {
+			add_assoc_long(dst, "fallthrough_index", op_index + 1);
+		} else {
+			add_assoc_null(dst, "fallthrough_index");
+		}
+		array_init(&jump_targets);
+
+		if (op1_target >= 0) {
+			add_assoc_long(dst, "op1.jump_target_index", op1_target);
+			dasm_add_jump_target_entry(&jump_targets, "op1", 1, op1_target);
+		}
+		if (op2_target >= 0) {
+			add_assoc_long(dst, "op2.jump_target_index", op2_target);
+			dasm_add_jump_target_entry(&jump_targets, "op2", 2, op2_target);
+		}
+
+		if (display_opcode == ZEND_JMPZNZ ||
+		    display_opcode == ZEND_FE_FETCH_R ||
+		    display_opcode == ZEND_FE_FETCH_RW) {
+			ext_target = dasm_extended_target_index(op_array, raw_src, raw_src->extended_value);
+			if (ext_target >= 0) {
+				add_assoc_long(dst, "extended.jump_target_index", ext_target);
+				dasm_add_jump_target_entry(&jump_targets, "extended", 0, ext_target);
+			}
+		}
+
+		if ((display_opcode == ZEND_FE_RESET_R || display_opcode == ZEND_FE_RESET_RW) &&
+		    op2_target >= 0) {
+			add_assoc_long(dst, "fe_reset_done_target_index", op2_target);
+		}
+		if ((display_opcode == ZEND_JMPZ || display_opcode == ZEND_JMPZ_EX ||
+		     display_opcode == ZEND_COALESCE || display_opcode == ZEND_JMP_SET ||
+		     display_opcode == ZEND_ASSERT_CHECK) && op2_target >= 0) {
+			add_assoc_long(dst, "false_target_index", op2_target);
+		}
+		if ((display_opcode == ZEND_JMPNZ || display_opcode == ZEND_JMPNZ_EX) &&
+		    op2_target >= 0) {
+			add_assoc_long(dst, "true_target_index", op2_target);
+		}
+
+		if (display_opcode == ZEND_JMP) {
+			add_assoc_long(dst, "jump_target_index", op1_target);
+		} else if (op2_target >= 0) {
+			add_assoc_long(dst, "jump_target_index", op2_target);
+		} else if (op1_target >= 0) {
+			add_assoc_long(dst, "jump_target_index", op1_target);
+		} else if (ext_target >= 0) {
+			add_assoc_long(dst, "jump_target_index", ext_target);
+		} else {
+			add_assoc_null(dst, "jump_target_index");
+		}
+
+		add_assoc_zval(dst, "jump_targets", &jump_targets);
+	}
+
 	/* ZEND_JMPZNZ: extended_value is the second jump target (non-zero/non-null branch).
 	 * On 32-bit (ZEND_USE_ABS_JMP_ADDR=1): stored as absolute opline pointer cast to uint32_t.
 	 * On 64-bit (ZEND_USE_ABS_JMP_ADDR=0): stored as relative byte offset from current opline. */
 	if (display_opcode == ZEND_JMPZNZ) {
-		zend_long ev_index = -1;
-#if ZEND_USE_ABS_JMP_ADDR
-		ev_index = dasm_index_from_address_base(
-			(uintptr_t)(uint32_t)raw_src->extended_value,
-			(uintptr_t)op_array->opcodes, op_array->last);
-#else
-		{
-			const zend_op *ev_target = (const zend_op *)((const char *)raw_src + (int32_t)raw_src->extended_value);
-			if (op_array->opcodes && ev_target >= op_array->opcodes &&
-			    ev_target < (op_array->opcodes + op_array->last)) {
-				ev_index = (zend_long)(ev_target - op_array->opcodes);
-			}
-		}
-#endif
+		zend_long ev_index = dasm_extended_target_index(op_array, raw_src, raw_src->extended_value);
 		add_assoc_long(dst, "jmpznz_true_opline", ev_index);
+		add_assoc_long(dst, "jmpznz_true_target_index", ev_index);
 	}
 
 	/* PHP 7.2 FE_FETCH_R/RW stores the foreach-exit jump in extended_value,
 	 * while op2 is the destination CV/VAR. Treating op2 as a jump target
 	 * produces out-of-range CFG edges (e.g. target 96 in a 44-op function). */
 	if (display_opcode == ZEND_FE_FETCH_R || display_opcode == ZEND_FE_FETCH_RW) {
-		zend_long ev_index = -1;
-		zend_long current_index = (op_array && op_array->opcodes && raw_src)
-			? (zend_long)(raw_src - op_array->opcodes) : -1;
-#if ZEND_USE_ABS_JMP_ADDR
-		ev_index = dasm_index_from_address_base(
-			(uintptr_t)(uint32_t)raw_src->extended_value,
-			(uintptr_t)op_array->opcodes, op_array->last);
-#endif
-		if (ev_index < 0 && current_index >= 0 &&
-		    (raw_src->extended_value % sizeof(zend_op)) == 0) {
-			zend_long rel = (zend_long)(raw_src->extended_value / sizeof(zend_op));
-			zend_long candidate = current_index + rel;
-			if (candidate >= 0 && candidate < (zend_long)op_array->last) {
-				ev_index = candidate;
-			}
-		}
+		zend_long ev_index = dasm_extended_target_index(op_array, raw_src, raw_src->extended_value);
 		add_assoc_long(dst, "fe_fetch_done_opline", ev_index);
+		add_assoc_long(dst, "fe_fetch_done_target_index", ev_index);
 	}
 }
 
@@ -2204,6 +2303,11 @@ static void inline dasm_zend_try_catch_element(zval *dst, const zend_try_catch_e
 	add_assoc_long_ex(dst, ("catch_op"),   (sizeof("catch_op")),   src->catch_op);
 	add_assoc_long_ex(dst, ("finally_op"), (sizeof("finally_op")), src->finally_op);
 	add_assoc_long_ex(dst, ("finally_end"),(sizeof("finally_end")),src->finally_end);
+	/* Explicit aliases for CFG/AST consumers. */
+	add_assoc_long(dst, "try_start_index", src->try_op);
+	add_assoc_long(dst, "catch_start_index", src->catch_op);
+	add_assoc_long(dst, "finally_start_index", src->finally_op);
+	add_assoc_long(dst, "finally_end_index", src->finally_end);
 }
 
 static void inline dasm_HashTable(zval *dst, HashTable *src)
