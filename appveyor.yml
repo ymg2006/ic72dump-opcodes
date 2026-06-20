@@ -1,0 +1,52 @@
+version: 1.0.{build}
+
+image: Visual Studio 2017
+
+clone_folder: c:\projects\ic72dump-opcodes2
+
+platform:
+  - x86
+
+configuration:
+  - Release
+
+build: off
+test: off
+
+environment:
+  PHP_VERSION: 7.2.34
+  PHP_DEVEL_DIR: build\devel\php-7.2.34-devel-VC15-x86
+  ARTIFACT_NAME: php_opcodedump-7.2.34-nts-vc15-x86
+
+install:
+  - cd /d %APPVEYOR_BUILD_FOLDER%
+  - if not exist "%PHP_DEVEL_DIR%\include\main\php.h" powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $url='https://windows.php.net/downloads/releases/archives/php-devel-pack-7.2.34-nts-Win32-VC15-x86.zip'; New-Item -ItemType Directory -Force build\devel | Out-Null; Invoke-WebRequest -Uri $url -OutFile build\php-devel-pack.zip; Expand-Archive -Path build\php-devel-pack.zip -DestinationPath build\devel -Force"
+
+build_script:
+  - cd /d %APPVEYOR_BUILD_FOLDER%
+  - call build\build.bat
+
+after_build:
+  - cd /d %APPVEYOR_BUILD_FOLDER%
+  - if not exist artifacts mkdir artifacts
+  - if not exist package mkdir package
+  - copy build\out\php_opcodedump.dll package\php_opcodedump.dll
+  - if exist build\out\php_opcodedump.lib copy build\out\php_opcodedump.lib package\php_opcodedump.lib
+  - if exist build\out\php_opcodedump.exp copy build\out\php_opcodedump.exp package\php_opcodedump.exp
+  - copy README.md package\README.md
+  - powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $zip = Join-Path 'artifacts' ($env:ARTIFACT_NAME + '-v' + $env:APPVEYOR_BUILD_VERSION + '.zip'); if (Test-Path $zip) { Remove-Item $zip -Force }; Compress-Archive -Path package\* -DestinationPath $zip -Force"
+  - dir artifacts
+
+artifacts:
+  - path: artifacts\*.zip
+    name: php_opcodedump_zip
+
+deploy:
+  - provider: GitHub
+    release: php_opcodedump-v$(APPVEYOR_BUILD_VERSION)
+    description: Release description
+    auth_token:
+      secure: 5ZaT9wKNoENOi2va55xzYo5MQyHlqRyQr71DFBw6A7ovfj0CBwa20gQrl13IjbqX
+    artifact: /.*\.zip/
+    draft: false
+    prerelease: false

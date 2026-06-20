@@ -1,0 +1,15 @@
+# Build outputs
+build/out/
+artifacts/
+package/
+*.obj
+*.exp
+*.lib
+*.dll
+*.zip
+
+# Local/editor noise
+.vs/
+*.user
+*.suo
+.DS_Store
