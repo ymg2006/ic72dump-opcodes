@@ -458,6 +458,79 @@ static zend_long dasm_extended_target_index(const zend_op_array *op_array,
 	return -1;
 }
 
+
+static zend_long dasm_safe_extended_target_index(const zend_op_array *op_array,
+                                                const zend_op *opline)
+{
+#ifdef PHP_WIN32
+	zend_long result = -1;
+	__try {
+		if (opline == NULL) {
+			return -1;
+		}
+		result = dasm_extended_target_index(op_array, opline, opline->extended_value);
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		result = -1;
+	}
+	return result;
+#else
+	if (opline == NULL) {
+		return -1;
+	}
+	return dasm_extended_target_index(op_array, opline, opline->extended_value);
+#endif
+}
+
+
+/* Read jump operands from the raw Zend opline, not from the materialized display
+ * copy.  ionCube/runtime materialization may replace op*.jmp_addr with a small
+ * integer/opline-looking value.  Treating that materialized value as an exact
+ * CFG target creates bogus edges such as JMPZ target == fallthrough or jumps
+ * into unrelated later code.  This wrapper keeps target export exact: if the raw
+ * operand cannot be read/decoded safely, no explicit target is exported. */
+static zend_long dasm_safe_raw_operand_target_index(const zend_op_array *op_array,
+                                                    const zend_op *opline,
+                                                    zend_uchar opcode,
+                                                    int operand_index)
+{
+#ifdef PHP_WIN32
+	zend_long result = -1;
+	__try {
+		znode_op operand;
+		if (opline == NULL) {
+			return -1;
+		}
+		if (operand_index == 1) {
+			operand = opline->op1;
+		} else if (operand_index == 2) {
+			operand = opline->op2;
+		} else if (operand_index == 3) {
+			operand = opline->result;
+		} else {
+			return -1;
+		}
+		result = dasm_jump_target_index(op_array, opline, opcode, operand_index, operand);
+	} __except(EXCEPTION_EXECUTE_HANDLER) {
+		result = -1;
+	}
+	return result;
+#else
+	if (opline == NULL) {
+		return -1;
+	}
+	if (operand_index == 1) {
+		return dasm_jump_target_index(op_array, opline, opcode, operand_index, opline->op1);
+	}
+	if (operand_index == 2) {
+		return dasm_jump_target_index(op_array, opline, opcode, operand_index, opline->op2);
+	}
+	if (operand_index == 3) {
+		return dasm_jump_target_index(op_array, opline, opcode, operand_index, opline->result);
+	}
+	return -1;
+#endif
+}
+
 static void dasm_add_jump_target_entry(zval *targets, const char *kind,
                                        int operand_index, zend_long target_index)
 {
@@ -2191,8 +2264,8 @@ static void inline dasm_zend_op(zval *dst, const zend_op_array *op_array, const 
 	{
 		zend_long op_index = (op_array && op_array->opcodes && raw_src)
 			? (zend_long)(raw_src - op_array->opcodes) : -1;
-		zend_long op1_target = dasm_jump_target_index(op_array, raw_src, display_opcode, 1, src->op1);
-		zend_long op2_target = dasm_jump_target_index(op_array, raw_src, display_opcode, 2, src->op2);
+		zend_long op1_target = dasm_safe_raw_operand_target_index(op_array, raw_src, display_opcode, 1);
+		zend_long op2_target = dasm_safe_raw_operand_target_index(op_array, raw_src, display_opcode, 2);
 		zend_long ext_target = -1;
 		zval jump_targets;
 
@@ -2216,7 +2289,7 @@ static void inline dasm_zend_op(zval *dst, const zend_op_array *op_array, const 
 		if (display_opcode == ZEND_JMPZNZ ||
 		    display_opcode == ZEND_FE_FETCH_R ||
 		    display_opcode == ZEND_FE_FETCH_RW) {
-			ext_target = dasm_extended_target_index(op_array, raw_src, raw_src->extended_value);
+			ext_target = dasm_safe_extended_target_index(op_array, raw_src);
 			if (ext_target >= 0) {
 				add_assoc_long(dst, "extended.jump_target_index", ext_target);
 				dasm_add_jump_target_entry(&jump_targets, "extended", 0, ext_target);
@@ -2237,7 +2310,7 @@ static void inline dasm_zend_op(zval *dst, const zend_op_array *op_array, const 
 			add_assoc_long(dst, "true_target_index", op2_target);
 		}
 
-		if (display_opcode == ZEND_JMP) {
+		if (display_opcode == ZEND_JMP && op1_target >= 0) {
 			add_assoc_long(dst, "jump_target_index", op1_target);
 		} else if (op2_target >= 0) {
 			add_assoc_long(dst, "jump_target_index", op2_target);
@@ -2256,7 +2329,7 @@ static void inline dasm_zend_op(zval *dst, const zend_op_array *op_array, const 
 	 * On 32-bit (ZEND_USE_ABS_JMP_ADDR=1): stored as absolute opline pointer cast to uint32_t.
 	 * On 64-bit (ZEND_USE_ABS_JMP_ADDR=0): stored as relative byte offset from current opline. */
 	if (display_opcode == ZEND_JMPZNZ) {
-		zend_long ev_index = dasm_extended_target_index(op_array, raw_src, raw_src->extended_value);
+		zend_long ev_index = dasm_safe_extended_target_index(op_array, raw_src);
 		add_assoc_long(dst, "jmpznz_true_opline", ev_index);
 		add_assoc_long(dst, "jmpznz_true_target_index", ev_index);
 	}
@@ -2265,7 +2338,7 @@ static void inline dasm_zend_op(zval *dst, const zend_op_array *op_array, const 
 	 * while op2 is the destination CV/VAR. Treating op2 as a jump target
 	 * produces out-of-range CFG edges (e.g. target 96 in a 44-op function). */
 	if (display_opcode == ZEND_FE_FETCH_R || display_opcode == ZEND_FE_FETCH_RW) {
-		zend_long ev_index = dasm_extended_target_index(op_array, raw_src, raw_src->extended_value);
+		zend_long ev_index = dasm_safe_extended_target_index(op_array, raw_src);
 		add_assoc_long(dst, "fe_fetch_done_opline", ev_index);
 		add_assoc_long(dst, "fe_fetch_done_target_index", ev_index);
 	}

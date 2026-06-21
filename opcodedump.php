@@ -35,6 +35,18 @@ function normalize_key($key)
         'declared_lambda' => 'declared_lambdas',
         'dumped_closure_op_array' => 'dumped_closure_op_arrays',
         'fe_fetch_done_oplin' => 'fe_fetch_done_opline',
+        'jump_target_inde' => 'jump_target_index',
+        'fallthrough_inde' => 'fallthrough_index',
+        'target_inde' => 'target_index',
+        'false_target_inde' => 'false_target_index',
+        'true_target_inde' => 'true_target_index',
+        'fe_reset_done_target_inde' => 'fe_reset_done_target_index',
+        'fe_fetch_done_target_inde' => 'fe_fetch_done_target_index',
+        'jmpznz_true_target_inde' => 'jmpznz_true_target_index',
+        'op1.jump_target_inde' => 'op1.jump_target_index',
+        'op2.jump_target_inde' => 'op2.jump_target_index',
+        'result.jump_target_inde' => 'result.jump_target_index',
+        'extended.jump_target_inde' => 'extended.jump_target_index',
         'missin' => 'missing',
     );
 
@@ -92,6 +104,15 @@ function normalize_opcode_entry(array $opcode)
         'op2_type',
         'result_type',
         'extended_value',
+        'op_index',
+        'fallthrough_index',
+        'jump_target_index',
+        'false_target_index',
+        'true_target_index',
+        'fe_reset_done_target_index',
+        'fe_fetch_done_target_index',
+        'jmpznz_true_target_index',
+        'extended.jump_target_index',
         'lineno',
         'opcode_name',
         'op1_type_name',
@@ -107,14 +128,18 @@ function normalize_opcode_entry(array $opcode)
         'result.var',
         'result.num',
         'result.opline_num',
+        'result.jump_target_index',
         'op1.constant',
         'op1.var',
         'op1.num',
         'op1.opline_num',
+        'op1.jump_target_index',
         'op2.constant',
         'op2.var',
         'op2.num',
         'op2.opline_num',
+        'op2.jump_target_index',
+        'jump_targets',
         'handler',
     ));
 }
@@ -451,6 +476,7 @@ function operand_ir(array $opcode, $prefix, array $cvNames = array())
     $varKey = $prefix . '.var';
     $numKey = $prefix . '.num';
     $oplineKey = $prefix . '.opline_num';
+    $jumpTargetKey = $prefix . '.jump_target_index';
 
     $operand = array(
         'type' => isset($opcode[$typeKey]) ? $opcode[$typeKey] : null,
@@ -459,6 +485,7 @@ function operand_ir(array $opcode, $prefix, array $cvNames = array())
         'var' => isset($opcode[$varKey]) ? $opcode[$varKey] : null,
         'num' => isset($opcode[$numKey]) ? $opcode[$numKey] : null,
         'opline_num' => isset($opcode[$oplineKey]) ? $opcode[$oplineKey] : null,
+        'jump_target_index' => isset($opcode[$jumpTargetKey]) ? $opcode[$jumpTargetKey] : null,
         'cv_name' => isset($opcode[$cvNameKey]) ? $opcode[$cvNameKey] : null,
     );
 
@@ -531,11 +558,72 @@ function apply_clean_cv_name(array $operand, array $cvNames)
     return $operand;
 }
 
+
+function add_unique_target(array &$targets, $target)
+{
+    if ($target === null || $target === '') {
+        return;
+    }
+    if (!is_numeric($target)) {
+        return;
+    }
+    $target = (int)$target;
+    if ($target < 0) {
+        return;
+    }
+    if (!in_array($target, $targets, true)) {
+        $targets[] = $target;
+    }
+}
+
+function explicit_opcode_jump_targets(array $opcode)
+{
+    $targets = array();
+
+    // New C extension shape: jump_targets is an array of entries like
+    // ['kind' => 'op2', 'operand' => 2, 'target_index' => 123].
+    if (isset($opcode['jump_targets']) && is_array($opcode['jump_targets'])) {
+        foreach ($opcode['jump_targets'] as $entry) {
+            if (is_array($entry) && array_key_exists('target_index', $entry)) {
+                add_unique_target($targets, $entry['target_index']);
+            } elseif (is_numeric($entry)) {
+                add_unique_target($targets, $entry);
+            }
+        }
+    }
+
+    foreach (array(
+        'jump_target_index',
+        'false_target_index',
+        'true_target_index',
+        'fe_reset_done_target_index',
+        'fe_fetch_done_target_index',
+        'jmpznz_true_target_index',
+        'op1.jump_target_index',
+        'op2.jump_target_index',
+        'result.jump_target_index',
+        'extended.jump_target_index',
+    ) as $key) {
+        if (array_key_exists($key, $opcode)) {
+            add_unique_target($targets, $opcode[$key]);
+        }
+    }
+
+    return $targets;
+}
+
 function opcode_jump_targets(array $opcode)
 {
     $name = isset($opcode['opcode_name']) ? $opcode['opcode_name'] : '';
-    $targets = array();
 
+    // Prefer exact CFG target indexes exported by the fixed C extension.
+    $targets = explicit_opcode_jump_targets($opcode);
+    if (!empty($targets)) {
+        return $targets;
+    }
+
+    // Legacy fallback for old dumps. These values may be overloaded opline
+    // numbers, so downstream tools should treat them as best-effort.
     $op1Target = array('ZEND_JMP', 'ZEND_FAST_CALL');
     $op2Target = array(
         'ZEND_JMPZ',
@@ -552,29 +640,31 @@ function opcode_jump_targets(array $opcode)
     );
 
     if (in_array($name, $op1Target, true) && isset($opcode['op1.opline_num'])) {
-        $targets[] = (int)$opcode['op1.opline_num'];
+        add_unique_target($targets, $opcode['op1.opline_num']);
     }
     if (in_array($name, $op2Target, true) && isset($opcode['op2.opline_num'])) {
-        $targets[] = (int)$opcode['op2.opline_num'];
+        add_unique_target($targets, $opcode['op2.opline_num']);
     }
-    // JMPZNZ second target: non-zero/non-null branch resolved by C extension
-    if ($name === 'ZEND_JMPZNZ' && isset($opcode['jmpznz_true_opline']) && (int)$opcode['jmpznz_true_opline'] >= 0) {
-        $targets[] = (int)$opcode['jmpznz_true_opline'];
+    if ($name === 'ZEND_JMPZNZ' && isset($opcode['jmpznz_true_opline'])) {
+        add_unique_target($targets, $opcode['jmpznz_true_opline']);
     }
-    if (($name === 'ZEND_FE_FETCH_R' || $name === 'ZEND_FE_FETCH_RW')) {
-        if (isset($opcode['fe_fetch_done_opline']) && (int)$opcode['fe_fetch_done_opline'] >= 0) {
-            $targets[] = (int)$opcode['fe_fetch_done_opline'];
+    if ($name === 'ZEND_JMPZNZ' && isset($opcode['jmpznz_true_target_index'])) {
+        add_unique_target($targets, $opcode['jmpznz_true_target_index']);
+    }
+    if ($name === 'ZEND_FE_FETCH_R' || $name === 'ZEND_FE_FETCH_RW') {
+        if (isset($opcode['fe_fetch_done_target_index'])) {
+            add_unique_target($targets, $opcode['fe_fetch_done_target_index']);
+        } elseif (isset($opcode['fe_fetch_done_opline'])) {
+            add_unique_target($targets, $opcode['fe_fetch_done_opline']);
         } elseif (isset($opcode['extended_value']) && isset($opcode['opcode_index'])) {
             $ext = (int)$opcode['extended_value'];
             if ($ext % 28 === 0) {
-                $targets[] = (int)$opcode['opcode_index'] + (int)($ext / 28);
+                add_unique_target($targets, (int)$opcode['opcode_index'] + (int)($ext / 28));
             }
         }
     }
 
-    return array_values(array_unique(array_filter($targets, function ($target) {
-        return $target >= 0;
-    })));
+    return $targets;
 }
 
 // PHP 7.2 extended_value semantics per opcode (zend_compile.h)
@@ -629,8 +719,19 @@ function opcode_ir(array $opcode, $index, array $cvNames = array())
     $linenoRaw = isset($opcode['lineno']) ? (int)$opcode['lineno'] : null;
     $lineno    = $linenoRaw !== null ? ($linenoRaw & ~0x600000) : null;
 
+    $explicitTargets = explicit_opcode_jump_targets($opcode);
+
     $ir = array(
         'index'                  => $index,
+        'op_index'               => isset($opcode['op_index']) ? (int)$opcode['op_index'] : $index,
+        'fallthrough_index'      => isset($opcode['fallthrough_index']) && $opcode['fallthrough_index'] !== null ? (int)$opcode['fallthrough_index'] : null,
+        'jump_target_index'      => isset($opcode['jump_target_index']) && $opcode['jump_target_index'] !== null ? (int)$opcode['jump_target_index'] : null,
+        'false_target_index'     => isset($opcode['false_target_index']) && $opcode['false_target_index'] !== null ? (int)$opcode['false_target_index'] : null,
+        'true_target_index'      => isset($opcode['true_target_index']) && $opcode['true_target_index'] !== null ? (int)$opcode['true_target_index'] : null,
+        'fe_reset_done_target_index' => isset($opcode['fe_reset_done_target_index']) && $opcode['fe_reset_done_target_index'] !== null ? (int)$opcode['fe_reset_done_target_index'] : null,
+        'fe_fetch_done_target_index' => isset($opcode['fe_fetch_done_target_index']) && $opcode['fe_fetch_done_target_index'] !== null ? (int)$opcode['fe_fetch_done_target_index'] : null,
+        'jmpznz_true_target_index' => isset($opcode['jmpznz_true_target_index']) && $opcode['jmpznz_true_target_index'] !== null ? (int)$opcode['jmpznz_true_target_index'] : null,
+        'explicit_jump_targets'  => $explicitTargets,
         'line'                   => $lineno,
         'lineno_raw'             => $linenoRaw !== $lineno ? $linenoRaw : null,
         'opcode'                 => isset($opcode['opcode']) ? $opcode['opcode'] : null,
@@ -651,8 +752,14 @@ function opcode_ir(array $opcode, $index, array $cvNames = array())
     if ($opcodeName === 'ZEND_JMPZNZ' && isset($opcode['jmpznz_true_opline'])) {
         $ir['jmpznz_true_opline'] = (int)$opcode['jmpznz_true_opline'];
     }
+    if ($opcodeName === 'ZEND_JMPZNZ' && isset($opcode['jmpznz_true_target_index'])) {
+        $ir['jmpznz_true_target_index'] = (int)$opcode['jmpznz_true_target_index'];
+    }
     if (($opcodeName === 'ZEND_FE_FETCH_R' || $opcodeName === 'ZEND_FE_FETCH_RW') && isset($opcode['fe_fetch_done_opline'])) {
         $ir['fe_fetch_done_opline'] = (int)$opcode['fe_fetch_done_opline'];
+    }
+    if (($opcodeName === 'ZEND_FE_FETCH_R' || $opcodeName === 'ZEND_FE_FETCH_RW') && isset($opcode['fe_fetch_done_target_index'])) {
+        $ir['fe_fetch_done_target_index'] = (int)$opcode['fe_fetch_done_target_index'];
     }
 
     // Propagate decode_failed flag set by C extension on unreadable opcodes
